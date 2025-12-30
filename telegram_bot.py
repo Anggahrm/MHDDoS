@@ -811,15 +811,19 @@ Status: {"ONLINE" if r.is_alive else "OFFLINE"}
         
         elif tool == "check":
             await update.message.reply_text("Checking...")
+            result = ""
             try:
                 url = target if target.startswith("http") else f"http://{target}"
                 r = requests_get(url, timeout=20)
-                result = f"""
+                try:
+                    result = f"""
 Website Check for {url}:
 -----------------------
 Status Code: {r.status_code}
 Status: {"ONLINE" if r.status_code <= 500 else "OFFLINE"}
 """
+                finally:
+                    r.close()
             except Exception as e:
                 result = f"Check failed: {str(e)}"
             
