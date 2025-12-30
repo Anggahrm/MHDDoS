@@ -11,7 +11,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from json import load
+from json import JSONDecodeError, load
 from pathlib import Path
 from socket import gethostbyname
 from threading import Event, Thread
@@ -85,16 +85,22 @@ class AttackConfig:
     proxy_type: int = 0
     is_layer7: bool = True
     
+    # Default values stored as class attribute for consistency
+    _defaults = {
+        "method": "",
+        "target": "",
+        "port": 80,
+        "threads": 100,
+        "duration": 60,
+        "rpc": 1,
+        "proxy_type": 0,
+        "is_layer7": True,
+    }
+    
     def reset(self):
         """Reset configuration to defaults."""
-        self.method = ""
-        self.target = ""
-        self.port = 80
-        self.threads = 100
-        self.duration = 60
-        self.rpc = 1
-        self.proxy_type = 0
-        self.is_layer7 = True
+        for key, value in self._defaults.items():
+            setattr(self, key, value)
     
     def copy(self) -> 'AttackConfig':
         """Create a copy of this configuration."""
@@ -640,7 +646,13 @@ Use inline buttons to navigate and configure attacks.
         if not config.target and config.method:
             # Entering target
             target = text
-            if not target.startswith("http"):
+            
+            # For Layer 7, we need HTTP URLs
+            # For Layer 4, we can accept plain IP:port or hostname:port
+            if config.is_layer7 and not target.startswith("http"):
+                target = "http://" + target
+            elif not config.is_layer7 and not target.startswith("http"):
+                # For Layer 4, add http:// prefix just for URL parsing purposes
                 target = "http://" + target
             
             try:
@@ -801,8 +813,8 @@ Status: {"ONLINE" if r.is_alive else "OFFLINE"}
             await update.message.reply_text("Checking...")
             try:
                 url = target if target.startswith("http") else f"http://{target}"
-                with requests_get(url, timeout=20) as r:
-                    result = f"""
+                r = requests_get(url, timeout=20)
+                result = f"""
 Website Check for {url}:
 -----------------------
 Status Code: {r.status_code}
@@ -1094,8 +1106,11 @@ def main():
                 with open(config_path) as f:
                     config = load(f)
                     token = config.get("telegram_bot_token")
+            except JSONDecodeError as e:
+                print(f"Error: config.json contains invalid JSON: {str(e)}")
+                return
             except Exception as e:
-                print(f"Error: Failed to parse config.json: {str(e)}")
+                print(f"Error: Failed to read config.json: {str(e)}")
                 return
     
     if not token:
@@ -1108,7 +1123,13 @@ def main():
     allowed_users = []
     allowed_users_env = os.environ.get("TELEGRAM_ALLOWED_USERS")
     if allowed_users_env:
-        allowed_users = [int(uid.strip()) for uid in allowed_users_env.split(",") if uid.strip()]
+        for uid in allowed_users_env.split(","):
+            uid = uid.strip()
+            if uid:
+                try:
+                    allowed_users.append(int(uid))
+                except ValueError:
+                    print(f"Warning: Invalid user ID '{uid}' in TELEGRAM_ALLOWED_USERS - must be a numeric Telegram user ID, skipping")
     
     # Create and run bot
     bot = MHDDoSBot(token, allowed_users)
