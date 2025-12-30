@@ -157,6 +157,59 @@ docker compose run -it --entrypoint /bin/bash mhddos
 
 ---
 
+## Telegram Bot Interface
+
+MHDDoS now includes a user-friendly Telegram bot interface with inline keyboard navigation.
+
+**Setup**
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) on Telegram
+2. Get your bot token
+3. Set the token via environment variable or config.json:
+
+```shell script
+# Option 1: Environment variable
+export TELEGRAM_BOT_TOKEN='your-bot-token'
+
+# Option 2: Add to config.json
+{
+  "telegram_bot_token": "your-bot-token",
+  ...
+}
+```
+
+**Running the Bot**
+
+```shell script
+python3 telegram_bot.py
+```
+
+**Security: Restrict Access (Optional)**
+
+To restrict bot access to specific users:
+
+```shell script
+export TELEGRAM_ALLOWED_USERS='123456789,987654321'
+```
+
+**Bot Commands**
+
+- `/start` - Start the bot and show main menu
+- `/help` - Show help message
+- `/status` - Show current attack status
+- `/stop` - Stop all running attacks
+
+**Features**
+
+- Full inline keyboard navigation
+- Layer 7 and Layer 4 attack methods
+- Configurable threads, duration, and RPC
+- Proxy type selection
+- Built-in tools (INFO, PING, CHECK, DSTAT, TSSRV)
+- Attack status monitoring
+
+---
+
 ## Need a Cheap Server? 
 
 <a href="https://pfcloud.io/aff.php?aff=80"><img src="https://github.com/user-attachments/assets/172b3543-982b-450e-937d-3c4f84764a4f" width="728" alt="pfcloud"></a>
