@@ -95,6 +95,19 @@ class AttackConfig:
         self.rpc = 1
         self.proxy_type = 0
         self.is_layer7 = True
+    
+    def copy(self) -> 'AttackConfig':
+        """Create a copy of this configuration."""
+        return AttackConfig(
+            method=self.method,
+            target=self.target,
+            port=self.port,
+            threads=self.threads,
+            duration=self.duration,
+            rpc=self.rpc,
+            proxy_type=self.proxy_type,
+            is_layer7=self.is_layer7
+        )
 
 
 @dataclass
@@ -105,6 +118,7 @@ class AttackSession:
     start_time: float
     threads: List[Thread] = field(default_factory=list)
     is_running: bool = False
+    monitor_task: Optional[asyncio.Task] = None
 
 
 class MHDDoSBot:
@@ -842,25 +856,18 @@ Memory: {virtual_memory().percent}%
     
     async def start_attack(self, query, user_id: int, config: AttackConfig) -> None:
         """Start the attack with given configuration."""
-        # Stop any existing attack
+        # Stop any existing attack and cancel its monitor task
         if user_id in self.active_sessions:
-            self.active_sessions[user_id].event.clear()
-            self.active_sessions[user_id].is_running = False
+            old_session = self.active_sessions[user_id]
+            old_session.event.clear()
+            old_session.is_running = False
+            if old_session.monitor_task and not old_session.monitor_task.done():
+                old_session.monitor_task.cancel()
         
         event = Event()
-        event.clear()
         
         session = AttackSession(
-            config=AttackConfig(
-                method=config.method,
-                target=config.target,
-                port=config.port,
-                threads=config.threads,
-                duration=config.duration,
-                rpc=config.rpc,
-                proxy_type=config.proxy_type,
-                is_layer7=config.is_layer7
-            ),
+            config=config.copy(),
             event=event,
             start_time=time()
         )
@@ -877,8 +884,8 @@ Memory: {virtual_memory().percent}%
             else:
                 await self._start_layer4_attack(query, session)
             
-            # Start monitoring task
-            asyncio.create_task(self._monitor_attack(query, user_id, session))
+            # Start monitoring task and store reference for cleanup
+            session.monitor_task = asyncio.create_task(self._monitor_attack(query, user_id, session))
             
         except Exception as e:
             session.event.clear()
@@ -1083,9 +1090,13 @@ def main():
         # Try to load from config.json
         config_path = __dir__ / "config.json"
         if config_path.exists():
-            with open(config_path) as f:
-                config = load(f)
-                token = config.get("telegram_bot_token")
+            try:
+                with open(config_path) as f:
+                    config = load(f)
+                    token = config.get("telegram_bot_token")
+            except Exception as e:
+                print(f"Error: Failed to parse config.json: {str(e)}")
+                return
     
     if not token:
         print("Error: TELEGRAM_BOT_TOKEN environment variable or telegram_bot_token in config.json is required.")
