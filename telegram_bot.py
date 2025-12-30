@@ -9,15 +9,18 @@ Configure the bot token via environment variable TELEGRAM_BOT_TOKEN or config.js
 import asyncio
 import logging
 import os
-import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from json import load
 from pathlib import Path
+from socket import gethostbyname
 from threading import Event, Thread
-from time import sleep, time
-from typing import Any, Dict, List, Optional, Set
+from time import time
+from typing import Any, Dict, List, Optional
 
+from icmplib import ping as icmp_ping
+from psutil import cpu_percent, net_io_counters, virtual_memory
+from requests import get as requests_get
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -28,6 +31,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from yarl import URL
 
 # Import from start.py
 from start import (
@@ -36,16 +40,11 @@ from start import (
     HttpFlood,
     Layer4,
     Methods,
-    ProxyManager,
     ProxyUtiles,
     Tools,
     ToolsConsole,
-    bcolors,
     con,
 )
-from socket import gethostbyname
-from yarl import URL
-from PyRoxy import Proxy
 
 # Configure logging
 logging.basicConfig(
@@ -767,8 +766,7 @@ Org: {info.get('org', 'N/A')}
         elif tool == "ping":
             await update.message.reply_text("Pinging...")
             try:
-                from icmplib import ping
-                r = ping(domain, count=5, interval=0.2)
+                r = icmp_ping(domain, count=5, interval=0.2)
                 result = f"""
 Ping Results for {domain}:
 -------------------------
@@ -788,9 +786,8 @@ Status: {"ONLINE" if r.is_alive else "OFFLINE"}
         elif tool == "check":
             await update.message.reply_text("Checking...")
             try:
-                from requests import get
                 url = target if target.startswith("http") else f"http://{target}"
-                with get(url, timeout=20) as r:
+                with requests_get(url, timeout=20) as r:
                     result = f"""
 Website Check for {url}:
 -----------------------
@@ -823,8 +820,6 @@ UDP: {info.get('_ts3._udp.', 'Not found')}
     
     async def run_dstat(self, query) -> None:
         """Run DSTAT tool."""
-        from psutil import net_io_counters, cpu_percent, virtual_memory
-        
         nd = net_io_counters(pernic=False)
         result = f"""
 Network Statistics:

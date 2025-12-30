@@ -2,3 +2,6 @@ venv
 /.idea/
 files/proxies/*
 .DS_Store
+__pycache__/
+*.pyc
+*.pyo
