@@ -1,0 +1,13 @@
+{
+  "name": "tmate-app",
+  "version": "1.0.0",
+  "description": "A simple app to create tmate SSH sessions with custom names.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.17.1",
+    "express-validator": "^6.14.0"
+  }
+}
