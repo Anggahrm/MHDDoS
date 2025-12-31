@@ -2,4 +2,4 @@ build:
   docker:
     worker: Dockerfile
 run:
-  web: node server.js
+  worker: node server.js
