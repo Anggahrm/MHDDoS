@@ -12,6 +12,13 @@ Endpoints:
 - GET /attack/status - Get current attack status
 - GET /health - Health check endpoint
 - GET /info - Get server info and capabilities
+
+Environment Variables:
+- PORT: API server port (Heroku standard, takes precedence)
+- ATTACK_API_PORT: API server port (fallback, default: 5000)
+- ATTACK_API_HOST: API server host (default: 0.0.0.0)
+- ATTACK_API_KEY: API key for authentication (optional)
+- ATTACK_API_DEBUG: Enable debug mode (default: false)
 """
 
 import logging
@@ -569,7 +576,9 @@ def get_status():
 def main():
     """Main entry point."""
     # Get port from environment
-    port = int(os.environ.get("ATTACK_API_PORT", 5000))
+    # Support both PORT (Heroku standard) and ATTACK_API_PORT (custom)
+    # PORT takes precedence for Heroku deployment compatibility
+    port = int(os.environ.get("PORT", os.environ.get("ATTACK_API_PORT", 5000)))
     host = os.environ.get("ATTACK_API_HOST", "0.0.0.0")
     debug = os.environ.get("ATTACK_API_DEBUG", "false").lower() == "true"
     
