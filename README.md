@@ -157,6 +157,39 @@ docker compose run -it --entrypoint /bin/bash mhddos
 
 ---
 
+## FAQ
+
+### Why Python? Why not Rust or Zig for better performance?
+
+Python was chosen for MHDDoS for several important reasons:
+
+**1. Rapid Development & Ecosystem**
+- Python has an excellent ecosystem for network programming with libraries like `requests`, `cloudscraper`, `impacket`, and `PyRoxy`
+- These mature libraries provide features that would take significant time to reimplement in Rust/Zig
+
+**2. Performance is Network-Bound, Not CPU-Bound**
+- DDoS tools are primarily **I/O-bound** (network operations), not CPU-bound
+- The bottleneck is network bandwidth and connection handling, not code execution speed
+- Python's threading and asyncio handle concurrent connections efficiently for this use case
+
+**3. Multi-threading for Concurrency**
+- The script uses Python's `ThreadPoolExecutor` and multi-threading to handle thousands of concurrent connections
+- For I/O-bound operations, Python threads perform comparably to lower-level languages
+
+**4. Accessibility & Contribution**
+- Python is widely known, making it easier for users to understand, modify, and contribute
+- Lower barrier to entry for the community
+
+**5. Raw Socket Support**
+- Python's `socket` and `impacket` libraries provide low-level access needed for Layer 4 attacks (SYN, UDP, ICMP)
+
+**Note:** For maximum performance, consider:
+- Running multiple instances across different machines
+- Using the `BOMB` method which leverages the Go-based `bombardier` tool
+- Increasing thread count based on your system resources
+
+---
+
 ## Telegram Bot Interface
 
 MHDDoS now includes a user-friendly Telegram bot interface with inline keyboard navigation.
