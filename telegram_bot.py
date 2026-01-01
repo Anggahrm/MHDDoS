@@ -1837,8 +1837,7 @@ Use inline buttons to navigate and configure attacks.
                 raise RuntimeError("Event loop is closed")
         except RuntimeError:
             # No event loop exists or it's closed, create a new one
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            asyncio.set_event_loop(asyncio.new_event_loop())
         
         application = Application.builder().token(self.token).build()
         
