@@ -7,6 +7,7 @@ bot interface from attack resources. Multiple instances can be deployed
 to scale attack capabilities.
 
 Endpoints:
+- GET / - API welcome page with endpoint documentation
 - POST /attack/start - Start an attack
 - POST /attack/stop - Stop an attack  
 - GET /attack/status - Get current attack status
@@ -433,6 +434,25 @@ def require_api_key(f):
         return f(*args, **kwargs)
     decorated.__name__ = f.__name__
     return decorated
+
+
+@app.route('/', methods=['GET'])
+def root():
+    """Root endpoint - API welcome page."""
+    return jsonify({
+        "service": "MHDDoS Attack API",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "GET /": "This welcome page",
+            "GET /health": "Health check",
+            "GET /info": "Server information and capabilities",
+            "POST /attack/start": "Start an attack",
+            "POST /attack/stop": "Stop an attack",
+            "GET /attack/status": "Get attack status",
+        },
+        "documentation": "See /info for available attack methods and server capabilities",
+    })
 
 
 @app.route('/health', methods=['GET'])
