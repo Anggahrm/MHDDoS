@@ -13,6 +13,7 @@ import resource
 import traceback
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from json import JSONDecodeError, load
 from pathlib import Path
 from socket import gethostbyname
@@ -96,6 +97,45 @@ def get_max_threads() -> int:
 SYSTEM_MAX_THREADS = get_max_threads()
 
 __dir__ = Path(__file__).parent
+
+
+# Simple HTTP server for Heroku health checks
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler for Heroku port binding requirement."""
+    
+    def do_GET(self):
+        """Handle GET requests."""
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        
+        response = """
+        <!DOCTYPE html>
+        <html>
+        <head><title>MHDDoS Telegram Bot</title></head>
+        <body>
+            <h1>✅ MHDDoS Telegram Bot is Running</h1>
+            <p>The bot is active and polling for updates.</p>
+            <p>Use Telegram to interact with the bot.</p>
+        </body>
+        </html>
+        """
+        self.wfile.write(response.encode())
+    
+    def log_message(self, format, *args):
+        """Suppress default request logging."""
+        pass
+
+
+def start_health_check_server(port: int) -> None:
+    """
+    Start a simple HTTP server for Heroku health checks.
+    This allows the bot to run on Heroku's web dyno.
+    """
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logger.info(f"Health check server listening on port {port}")
+    server.serve_forever()
+
 
 # Proxy type constants
 PROXY_HTTP = 1
@@ -1838,6 +1878,12 @@ Use inline buttons to navigate and configure attacks.
         except RuntimeError:
             # No event loop exists or it's closed, create a new one
             asyncio.set_event_loop(asyncio.new_event_loop())
+        
+        # Start health check server for Heroku (required for web dyno)
+        port = int(os.environ.get('PORT', 8080))
+        health_thread = Thread(target=start_health_check_server, args=(port,), daemon=True)
+        health_thread.start()
+        logger.info(f"Started health check server on port {port}")
         
         application = Application.builder().token(self.token).build()
         
