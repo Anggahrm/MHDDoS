@@ -14,7 +14,6 @@ Endpoints:
 - GET /info - Get server info and capabilities
 """
 
-import asyncio
 import logging
 import os
 import resource
@@ -26,13 +25,14 @@ from json import dumps, load, loads
 from pathlib import Path
 from socket import gethostbyname
 from threading import Event, Thread, active_count
-from time import time
+from time import sleep, time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from PyRoxy import Proxy, ProxyChecker, ProxyType, ProxyUtiles
+from PyRoxy import Proxy, ProxyChecker, ProxyType
+from PyRoxy import ProxyUtiles as PyRoxyProxyUtiles
 from yarl import URL
 
 # Import from start.py
@@ -324,7 +324,7 @@ class AttackManager:
         
         try:
             while session.is_running and time() < start_time + duration:
-                asyncio.run(asyncio.sleep(1))
+                sleep(1)  # Use synchronous sleep in threaded context
                 
                 if not session.is_running:
                     break

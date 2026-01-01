@@ -305,6 +305,24 @@ class AttackAPI:
         )
 
 
+def sanitize_api_name(name: str) -> str:
+    """
+    Sanitize API name for consistent naming.
+    
+    - Converts to lowercase
+    - Replaces spaces with underscores
+    - Removes special characters except underscore and hyphen
+    - Limits length to 32 characters
+    """
+    import re
+    # Convert to lowercase and replace spaces
+    name = name.strip().lower().replace(" ", "_")
+    # Remove special characters except alphanumeric, underscore and hyphen
+    name = re.sub(r'[^a-z0-9_-]', '', name)
+    # Limit length
+    return name[:32]
+
+
 def get_proxy_file_path(proxy_type: int) -> Path:
     """Get the proxy file path based on proxy type."""
     proxy_type_names = {
@@ -1403,11 +1421,17 @@ Step 1/3: Enter a name for this API (e.g., "server1"):
             
             status = "✅ Enabled" if api.enabled else "⏸️ Disabled"
             
+            # Safely display API key (handle short keys)
+            if api.api_key:
+                key_display = '***' + api.api_key[-4:] if len(api.api_key) >= 4 else '***'
+            else:
+                key_display = 'None'
+            
             detail_text = f"""
 🌐 API: {api.name}
 ------------------
 📍 URL: {api.url}
-🔑 API Key: {'***' + api.api_key[-4:] if api.api_key else 'None'}
+🔑 API Key: {key_display}
 📊 Status: {status}
 🏥 Health: {health_status}
 {health_details}
@@ -1799,10 +1823,10 @@ Use inline buttons to navigate and configure attacks.
         
         # Handle API addition states
         if state_context == "api_add_name":
-            # Validate API name
-            api_name = text.strip().lower().replace(" ", "_")
+            # Validate and sanitize API name
+            api_name = sanitize_api_name(text)
             if not api_name:
-                await self.safe_reply(update.message, "⚠️ Invalid name. Please enter a valid API name:")
+                await self.safe_reply(update.message, "⚠️ Invalid name. Please enter a valid API name (alphanumeric, underscores, hyphens):")
                 return ConversationState.API_ADD.value
             
             # Check for existing API with same name
