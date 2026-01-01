@@ -1829,6 +1829,17 @@ Use inline buttons to navigate and configure attacks.
     
     def run(self) -> None:
         """Run the bot."""
+        # Fix for Python 3.10+ where asyncio.get_event_loop() doesn't auto-create event loops
+        # This ensures an event loop exists before run_polling() is called
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("Event loop is closed")
+        except RuntimeError:
+            # No event loop exists or it's closed, create a new one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
         application = Application.builder().token(self.token).build()
         
         # Add global error handler
