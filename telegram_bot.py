@@ -132,9 +132,16 @@ def start_health_check_server(port: int) -> None:
     Start a simple HTTP server for Heroku health checks.
     This allows the bot to run on Heroku's web dyno.
     """
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    logger.info(f"Health check server listening on port {port}")
-    server.serve_forever()
+    try:
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        logger.info(f"Health check server listening on port {port}")
+        server.serve_forever()
+    except OSError as e:
+        logger.error(f"Failed to start health check server on port {port}: {e}")
+        logger.error("The bot will continue running, but Heroku may terminate it if PORT binding is required.")
+    except Exception as e:
+        logger.error(f"Unexpected error in health check server: {e}")
+        logger.error(traceback.format_exc())
 
 
 # Proxy type constants
@@ -1880,10 +1887,15 @@ Use inline buttons to navigate and configure attacks.
             asyncio.set_event_loop(asyncio.new_event_loop())
         
         # Start health check server for Heroku (required for web dyno)
-        port = int(os.environ.get('PORT', 8080))
+        try:
+            port = int(os.environ.get('PORT', 8080))
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid PORT environment variable, using default 8080: {e}")
+            port = 8080
+        
         health_thread = Thread(target=start_health_check_server, args=(port,), daemon=True)
         health_thread.start()
-        logger.info(f"Started health check server on port {port}")
+        logger.info(f"Started health check server thread on port {port}")
         
         application = Application.builder().token(self.token).build()
         
