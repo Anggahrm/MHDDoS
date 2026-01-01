@@ -293,12 +293,34 @@ git push heroku copilot/update-attack-api-for-heroku:main
 ```
 
 3. **Add to Telegram Bot:**
+   
+   **Via Telegram Bot Interface:**
    - Get your Heroku app URL: `https://your-app-name.herokuapp.com`
    - In Telegram bot, go to **🌐 API Manager** → **➕ Add API**
    - Enter: 
      - Name: `heroku-api1` (or any name)
      - URL: `https://your-app-name.herokuapp.com`
      - API Key: (if you set `ATTACK_API_KEY`)
+   
+   **Or edit config.json directly:**
+   ```json
+   {
+     "attack-apis": [
+       {
+         "name": "heroku-api1",
+         "url": "https://your-app-1.herokuapp.com",
+         "api_key": "your-secret-key",
+         "enabled": true
+       },
+       {
+         "name": "heroku-api2",
+         "url": "https://your-app-2.herokuapp.com",
+         "api_key": "",
+         "enabled": true
+       }
+     ]
+   }
+   ```
 
 **Note:** The PORT environment variable is automatically provided by Heroku and will be used by the Attack API.
 
@@ -352,6 +374,8 @@ curl -X POST http://localhost:5000/attack/stop \
 
 ### Connecting APIs to Telegram Bot
 
+**Option 1: Using Telegram Bot Interface (Recommended)**
+
 1. Deploy one or more Attack API servers
 2. In the Telegram bot, go to **🌐 API Manager**
 3. Click **➕ Add API**
@@ -360,6 +384,37 @@ curl -X POST http://localhost:5000/attack/stop \
    - **Local Attack** - Run on bot's machine
    - **API Attack** - Run on all connected APIs
    - **All** - Run on both local and APIs
+
+**Option 2: Using config.json (Manual Configuration)**
+
+You can also configure multiple API endpoints directly in `config.json`:
+
+```json
+{
+  "attack-apis": [
+    {
+      "name": "heroku-api1",
+      "url": "https://your-app-1.herokuapp.com",
+      "api_key": "",
+      "enabled": true
+    },
+    {
+      "name": "heroku-api2", 
+      "url": "https://your-app-2.herokuapp.com",
+      "api_key": "your-secret-key",
+      "enabled": true
+    },
+    {
+      "name": "vps-api1",
+      "url": "http://123.45.67.89:5000",
+      "api_key": "another-key",
+      "enabled": true
+    }
+  ]
+}
+```
+
+Simply add your Heroku app URLs (or any other server URLs) to the `attack-apis` array in `config.json`. The bot will automatically load and use these APIs.
 
 ---
 
