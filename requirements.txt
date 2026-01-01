@@ -9,3 +9,5 @@ pyasn1==0.4.8
 pyroxy @ git+https://github.com/MatrixTM/PyRoxy.git
 yarl>=1.7.2
 python-telegram-bot==21.7
+flask>=3.0.0
+flask-cors>=4.0.0
