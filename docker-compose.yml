@@ -1,14 +1,49 @@
 version: "3.9"
 
 services:
-  mhddos:
-    # image: ghcr.io/mhprodev/mhddos:latest
+  # Telegram Bot Service
+  mhddos-bot:
     build: .
-    container_name: mhddos
+    container_name: mhddos-bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS:-}
+    volumes:
+      - ./config.json:/app/config.json
+      - ./files:/app/files
+    ports:
+      - "8080:8080"
+    command: python telegram_bot.py
+
+  # Attack API Service (can be scaled for more resources)
+  mhddos-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: mhddos-api
+    restart: unless-stopped
+    environment:
+      - ATTACK_API_PORT=5000
+      - ATTACK_API_HOST=0.0.0.0
+      - ATTACK_API_KEY=${ATTACK_API_KEY:-}
+    volumes:
+      - ./config.json:/app/config.json
+      - ./files:/app/files
+    ports:
+      - "5000:5000"
+
+  # Legacy Node.js server (optional)
+  mhddos-tmate:
+    build: .
+    container_name: mhddos-tmate
     restart: unless-stopped
     volumes:
       - ./config.json:/app/config.json
       - ./files:/app/files
-     
-    
-    
+    ports:
+      - "3000:3000"
+    command: node server.js
+    profiles:
+      - tmate
+

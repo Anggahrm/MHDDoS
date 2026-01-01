@@ -1,0 +1,38 @@
+# Attack API Server Dockerfile
+# Use for deploying standalone attack API instances
+
+FROM python:3.12-slim
+
+LABEL maintainer="0xkatana"
+LABEL description="MHDDoS Attack API Server"
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements.txt for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY start.py .
+COPY attack_api.py .
+COPY config.json .
+COPY files/ ./files/
+
+# Expose port for API server
+EXPOSE 5000
+
+# Environment variables (can be overridden)
+ENV ATTACK_API_PORT=5000
+ENV ATTACK_API_HOST=0.0.0.0
+
+# Run the attack API server
+CMD ["python", "attack_api.py"]
