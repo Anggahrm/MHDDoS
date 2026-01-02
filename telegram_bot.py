@@ -178,6 +178,22 @@ class ConversationState(Enum):
     SELECT_ATTACK_MODE = auto()  # State for selecting local vs API attack
 
 
+# Attack mode constants and display names
+ATTACK_MODE_LOCAL = "local"
+ATTACK_MODE_API = "api"
+ATTACK_MODE_ALL = "all"
+
+ATTACK_MODE_NAMES = {
+    ATTACK_MODE_LOCAL: "🖥️ Local",
+    ATTACK_MODE_API: "🌐 API Only",
+    ATTACK_MODE_ALL: "🔀 All (Local + API)"
+}
+
+CALLBACK_TO_MODE = {
+    "attack_mode_local": ATTACK_MODE_LOCAL,
+    "attack_mode_api": ATTACK_MODE_API,
+    "attack_mode_all": ATTACK_MODE_ALL
+}
 @dataclass
 class AttackConfig:
     """Configuration for an attack session."""
@@ -189,6 +205,7 @@ class AttackConfig:
     rpc: int = 1
     proxy_type: int = 0
     is_layer7: bool = True
+    attack_mode: str = "local"  # "local", "api", or "all"
     
     # Default values stored as class attribute for consistency
     _defaults = {
@@ -200,6 +217,7 @@ class AttackConfig:
         "rpc": 1,
         "proxy_type": 0,
         "is_layer7": True,
+        "attack_mode": "local",
     }
     
     def reset(self):
@@ -217,12 +235,17 @@ class AttackConfig:
             duration=self.duration,
             rpc=self.rpc,
             proxy_type=self.proxy_type,
-            is_layer7=self.is_layer7
+            is_layer7=self.is_layer7,
+            attack_mode=self.attack_mode
         )
     
-    def validate(self) -> Tuple[bool, str]:
+    def validate(self, custom_max_threads: int = 0) -> Tuple[bool, str]:
         """
         Validate the attack configuration.
+        
+        Args:
+            custom_max_threads: Custom max threads limit. When > 0, uses this value
+                              instead of SYSTEM_MAX_THREADS for validation.
         
         Returns:
             Tuple of (is_valid, error_message)
@@ -236,8 +259,12 @@ class AttackConfig:
         if self.threads < 1:
             return False, "Thread count must be at least 1"
         
-        if self.threads > SYSTEM_MAX_THREADS:
-            return False, f"Thread count exceeds system limit ({SYSTEM_MAX_THREADS}). Please use a lower value."
+        # Only validate thread limit for local attacks
+        # For API-only attacks, the API servers handle their own limits
+        if self.attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL):
+            max_limit = custom_max_threads if custom_max_threads > 0 else SYSTEM_MAX_THREADS
+            if self.threads > max_limit:
+                return False, f"Thread count exceeds system limit ({max_limit}). Please use a lower value."
         
         if self.duration < 1:
             return False, "Duration must be at least 1 second"
@@ -1012,10 +1039,11 @@ class MHDDoSBot:
         layer = "Layer 7" if config.is_layer7 else "Layer 4"
         proxy_names = {0: "All", 1: "HTTP", 4: "SOCKS4", 5: "SOCKS5", 6: "Random", -1: "None"}
         proxy = proxy_names.get(config.proxy_type, str(config.proxy_type))
+        mode = ATTACK_MODE_NAMES.get(config.attack_mode, config.attack_mode)
         
-        # Add warning if threads exceed recommended limit
+        # Add warning if threads exceed recommended limit (only for local/all modes)
         thread_warning = ""
-        if config.threads > SYSTEM_MAX_THREADS * 0.8:
+        if config.attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL) and config.threads > SYSTEM_MAX_THREADS * 0.8:
             thread_warning = f"\n⚠️ High thread count (limit: {SYSTEM_MAX_THREADS})"
         
         summary = f"""
@@ -1023,6 +1051,7 @@ class MHDDoSBot:
 ------------------------
 🎯 Layer: {layer}
 ⚡ Method: {config.method}
+🎮 Mode: {mode}
 🌐 Target: {config.target}
 🔌 Port: {config.port}
 🧵 Threads: {config.threads}{thread_warning}
@@ -1574,8 +1603,7 @@ Step 1/3: Enter a name for this API (e.g., "server1"):
                         error_info += f"\n📛 Last: {session.last_error[:50]}"
                 
                 # Attack mode info
-                mode_desc = {"local": "🖥️ Local", "api": "🌐 API", "all": "🔀 Local + API"}
-                mode_info = mode_desc.get(session.attack_mode, session.attack_mode)
+                mode_info = ATTACK_MODE_NAMES.get(session.attack_mode, session.attack_mode)
                 
                 # API attack status
                 api_status = ""
@@ -1651,14 +1679,42 @@ Use inline buttons to navigate and configure attacks.
             )
             return ConversationState.MAIN_MENU.value
         
-        # Method selection
+        # Method selection - now asks for attack mode first if APIs are configured
         elif data.startswith("method_"):
             method = data.replace("method_", "")
             config.method = method
+            
+            # Check if there are enabled APIs
+            enabled_apis = self.get_enabled_apis()
+            if enabled_apis:
+                # Show attack mode selection FIRST
+                await self.safe_edit_message(
+                    query,
+                    f"⚡ Method: {method}\n\n🎯 Select attack mode:\n\n"
+                    f"• 🖥️ Local: Attack from this server only\n"
+                    f"• 🌐 API: Attack from {len(enabled_apis)} API servers\n"
+                    f"• 🔀 All: Attack from this server + all APIs",
+                    reply_markup=self.get_attack_mode_keyboard()
+                )
+                return ConversationState.SELECT_ATTACK_MODE.value
+            else:
+                # No APIs configured, continue with local attack
+                config.attack_mode = ATTACK_MODE_LOCAL
+                self.user_state_context[user_id] = "enter_target"
+                await self.safe_edit_message(
+                    query,
+                    f"⚡ Method: {method}\n\n📝 Enter target URL/IP:"
+                )
+                return ConversationState.ENTER_TARGET.value
+        
+        # Attack mode selection - then continue to target entry
+        elif data in CALLBACK_TO_MODE:
+            config.attack_mode = CALLBACK_TO_MODE[data]
+            
             self.user_state_context[user_id] = "enter_target"
             await self.safe_edit_message(
                 query,
-                f"⚡ Method: {method}\n\n📝 Enter target URL/IP:"
+                f"⚡ Method: {config.method}\n🎮 Mode: {ATTACK_MODE_NAMES[config.attack_mode]}\n\n📝 Enter target URL/IP:"
             )
             return ConversationState.ENTER_TARGET.value
         
@@ -1667,18 +1723,23 @@ Use inline buttons to navigate and configure attacks.
             value = data.replace("threads_", "")
             if value == "custom":
                 self.user_state_context[user_id] = "enter_threads"
+                # Show appropriate limit based on attack mode
+                if config.attack_mode == ATTACK_MODE_API:
+                    limit_msg = "ℹ️ API servers will enforce their own limits"
+                else:
+                    limit_msg = f"⚠️ Local system max: {SYSTEM_MAX_THREADS}"
                 await self.safe_edit_message(
                     query,
-                    f"📝 Enter custom thread count:\n\n⚠️ System max: {SYSTEM_MAX_THREADS}"
+                    f"📝 Enter custom thread count:\n\n{limit_msg}"
                 )
                 return ConversationState.ENTER_THREADS.value
             else:
                 thread_count = int(value)
-                # Validate against system limit
-                if thread_count > SYSTEM_MAX_THREADS:
+                # Only validate against local system limit for local/all modes
+                if config.attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL) and thread_count > SYSTEM_MAX_THREADS:
                     await self.safe_edit_message(
                         query,
-                        f"⚠️ {thread_count} threads exceeds system limit ({SYSTEM_MAX_THREADS}).\n\nPlease select a lower value:",
+                        f"⚠️ {thread_count} threads exceeds local system limit ({SYSTEM_MAX_THREADS}).\n\nPlease select a lower value:",
                         reply_markup=self.get_threads_keyboard()
                     )
                     return ConversationState.ENTER_THREADS.value
@@ -1770,7 +1831,7 @@ Use inline buttons to navigate and configure attacks.
             )
             return ConversationState.CONFIRM_ATTACK.value
         
-        # Confirmation
+        # Confirmation - attack mode is already set earlier in the flow
         elif data == "confirm_start":
             # Validate config before starting
             is_valid, error_msg = config.validate()
@@ -1782,33 +1843,8 @@ Use inline buttons to navigate and configure attacks.
                 )
                 return ConversationState.MAIN_MENU.value
             
-            # Check if there are enabled APIs
-            enabled_apis = self.get_enabled_apis()
-            if enabled_apis:
-                # Show attack mode selection
-                await self.safe_edit_message(
-                    query,
-                    self.format_config_summary(config) + "\n\n🎯 Select attack mode:",
-                    reply_markup=self.get_attack_mode_keyboard()
-                )
-                return ConversationState.SELECT_ATTACK_MODE.value
-            else:
-                # No APIs configured, start local attack directly
-                await self.start_attack(query, user_id, config, attack_mode="local")
-                return ConversationState.MAIN_MENU.value
-        
-        # Attack mode selection handlers (combined for DRY)
-        elif data in ("attack_mode_local", "attack_mode_api", "attack_mode_all"):
-            # Map callback data to attack mode
-            mode_map = {
-                "attack_mode_local": "local",
-                "attack_mode_api": "api",
-                "attack_mode_all": "all"
-            }
-            attack_mode = mode_map[data]
-            
-            # Validation is done in start_attack, just call it
-            await self.start_attack(query, user_id, config, attack_mode=attack_mode)
+            # Start attack with the attack_mode already set in config
+            await self.start_attack(query, user_id, config, attack_mode=config.attack_mode)
             return ConversationState.MAIN_MENU.value
         
         elif data == "confirm_cancel":
@@ -2114,10 +2150,11 @@ Step 3/3: Enter API key (or type 'none' for no key):
                 if value < 1:
                     await self.safe_reply(update.message, "⚠️ Thread count must be at least 1. Enter thread count:")
                     return ConversationState.ENTER_THREADS.value
-                if value > SYSTEM_MAX_THREADS:
+                # Only validate against local limit for local/all modes
+                if config.attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL) and value > SYSTEM_MAX_THREADS:
                     await self.safe_reply(
                         update.message,
-                        f"⚠️ {value} threads exceeds system limit ({SYSTEM_MAX_THREADS}).\n\n📝 Enter a lower value:"
+                        f"⚠️ {value} threads exceeds local system limit ({SYSTEM_MAX_THREADS}).\n\n📝 Enter a lower value:"
                     )
                     return ConversationState.ENTER_THREADS.value
                 
@@ -2198,10 +2235,11 @@ Step 3/3: Enter API key (or type 'none' for no key):
             
             # Could be threads, duration, or RPC - determine from defaults
             if config.threads == 100:  # Default, likely entering custom threads
-                if value > SYSTEM_MAX_THREADS:
+                # Only validate against local limit for local/all modes
+                if config.attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL) and value > SYSTEM_MAX_THREADS:
                     await self.safe_reply(
                         update.message,
-                        f"⚠️ {value} threads exceeds system limit ({SYSTEM_MAX_THREADS}).\n\n📝 Enter a lower value:"
+                        f"⚠️ {value} threads exceeds local system limit ({SYSTEM_MAX_THREADS}).\n\n📝 Enter a lower value:"
                     )
                     return ConversationState.ENTER_THREADS.value
                 
@@ -2458,11 +2496,11 @@ Step 3/3: Enter API key (or type 'none' for no key):
             api_results = []
             local_started = False
             
-            if attack_mode in ("api", "all"):
+            if attack_mode in (ATTACK_MODE_API, ATTACK_MODE_ALL):
                 # Start API attacks
                 api_results = await self._start_api_attacks(session, config)
             
-            if attack_mode in ("local", "all"):
+            if attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL):
                 # Start local attack
                 if config.is_layer7:
                     await self._start_layer7_attack(query, session)
@@ -2487,13 +2525,12 @@ Step 3/3: Enter API key (or type 'none' for no key):
             session.monitor_task = asyncio.create_task(self._monitor_attack(query, user_id, session))
             
             # Show success message
-            mode_desc = {"local": "🖥️ Local", "api": "🌐 API", "all": "🔀 Local + API"}
             msg = (
                 f"🚀 Attack Started!\n"
                 f"━━━━━━━━━━━━━━━\n"
                 f"🎯 Target: {config.target}\n"
                 f"⚡ Method: {config.method}\n"
-                f"🎮 Mode: {mode_desc.get(attack_mode, attack_mode)}\n"
+                f"🎮 Mode: {ATTACK_MODE_NAMES.get(attack_mode, attack_mode)}\n"
                 f"⏱️ Duration: {config.duration}s\n"
                 f"━━━━━━━━━━━━━━━\n"
                 f"📊 Results:\n" + "\n".join(result_parts) + "\n\n"
